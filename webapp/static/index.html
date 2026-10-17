@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Person Search</title>
+  <meta name="description" content="SpaceTime-DSCA: tìm người trong video bằng câu mô tả">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ccircle cx='14' cy='14' r='6' fill='none' stroke='white' stroke-width='3'/%3E%3Cpath d='M19 19l6 6' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script>
+    // Apply theme before first paint to avoid a flash
+    try {
+      const t = localStorage.getItem("ps.theme");
+      if (t) document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4m0 0-4 4m4-4 4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5v14l11-7z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/></symbol>
+    <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 3 7l9 5 9-5-9-5z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4"/><path d="M4 17v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 6.6C3.9 8.4 2 12 2 12s3.5 7 10 7c1.6 0 3-.4 4.3-1M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10m4 0h2M4 12h4m4 0h8M4 18h12m4 0h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4m10 0h4M3 15h4m10 0h4"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4m0 10v4M3 12h4m10 0h4M6 6l2.5 2.5m7 7L18 18M6 18l2.5-2.5m7-7L18 6"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-9.5v.5"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"><svg><use href="#i-search"/></svg></div>
+      <div>
+        <div class="brand-title">SpaceTime-DSCA</div>
+        <div class="brand-sub" data-i18n="brand_sub">Tìm người trong video bằng câu mô tả</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <label class="chip chip-select" data-i18n-title="ckpt_title" title="">
+        <svg><use href="#i-model"/></svg>
+        <select id="ckpt-select" aria-label="Checkpoint"></select>
+        <span id="ckpt-metrics" class="chip-muted"></span>
+      </label>
+      <span class="chip hide-sm" id="sys-chip"><svg><use href="#i-cpu"/></svg><span id="sys-text">…</span></span>
+      <div class="seg seg-sm" role="group" aria-label="Language">
+        <button type="button" data-lang="vi">VI</button>
+        <button type="button" data-lang="en">EN</button>
+      </div>
+      <button type="button" class="icon-btn" id="theme-btn" data-i18n-title="theme_toggle" title="">
+        <svg class="if-light"><use href="#i-moon"/></svg>
+        <svg class="if-dark"><use href="#i-sun"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ============ SIDEBAR: 3 steps ============ -->
+    <aside class="sidebar">
+      <!-- Step 1: video -->
+      <section class="card step" id="step-video" data-state="active" data-collapsed="false">
+        <header class="step-head">
+          <span class="step-num">1</span>
+          <h2 data-i18n="s1_title">Chọn video</h2>
+          <button type="button" class="step-summary" id="video-summary" data-expand="step-video">
+            <img id="vs-thumb" alt="">
+            <span class="sum-text"><span class="sum-main" id="vs-name"></span><span class="sum-sub" id="vs-sub"></span></span>
+          </button>
+          <button type="button" class="btn btn-ghost btn-xs" id="vs-change" data-expand="step-video" data-i18n="change">Đổi</button>
+          <button type="button" class="step-toggle" data-toggle="step-video" aria-expanded="true" data-i18n-title="collapse" title=""><svg><use href="#i-chevron"/></svg></button>
+        </header>
+
+        <div class="step-body">
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept="video/*,.mkv,.avi">
+            <svg class="dz-icon"><use href="#i-upload"/></svg>
+            <span class="dz-title" data-i18n="dz_title">Kéo thả video vào đây</span>
+            <span class="dz-sub" data-i18n="dz_sub">hoặc bấm để chọn file · MP4, AVI, MOV, MKV, WEBM</span>
+            <span class="dz-progress" hidden><span class="bar"><i></i></span><span class="dz-pct"></span></span>
+          </label>
+
+          <div class="samples-wrap" id="samples-wrap" hidden>
+            <span class="label" data-i18n="samples">Video mẫu</span>
+            <div class="samples" id="samples"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 2: analyse -->
+      <section class="card step" id="step-analyze" data-state="locked" data-collapsed="false">
+        <header class="step-head">
+          <span class="step-num">2</span>
+          <h2 data-i18n="s2_title">Phân tích video</h2>
+          <span class="info" data-i18n-title="s2_hint" title=""><svg><use href="#i-info"/></svg></span>
+          <button type="button" class="step-summary" id="analyze-summary" data-expand="step-analyze">
+            <span class="sum-text"><span class="sum-main" id="as-main"></span><span class="sum-sub" id="as-sub"></span></span>
+          </button>
+          <button type="button" class="step-toggle" data-toggle="step-analyze" aria-expanded="true" data-i18n-title="collapse" title=""><svg><use href="#i-chevron"/></svg></button>
+        </header>
+
+        <div class="step-body">
+          <div class="opt-grid">
+            <span class="label" data-i18n="speed">Chế độ</span>
+            <span class="label" data-i18n="frames">Số frame</span>
+            <div class="seg seg-sm seg-full" id="stride-seg" role="radiogroup">
+              <button type="button" data-stride="1" data-i18n="speed_1">Chính xác</button>
+              <button type="button" data-stride="2" data-i18n="speed_2">Cân bằng</button>
+              <button type="button" data-stride="3" data-i18n="speed_3">Nhanh</button>
+            </div>
+            <select id="max-frames" class="select-sm">
+              <option value="150">150</option>
+              <option value="300" selected>300</option>
+              <option value="600">600</option>
+              <option value="1200">1200</option>
+              <option value="0" data-i18n="frames_all">Toàn bộ</option>
+            </select>
+          </div>
+          <label class="inline-range">
+            <span class="label" data-i18n="conf">Ngưỡng phát hiện</span>
+            <input type="range" id="conf" min="0.15" max="0.8" step="0.05" value="0.35">
+            <b id="conf-val" class="mono">0.35</b>
+          </label>
+          <p class="note" id="frames-note" hidden></p>
+
+          <button type="button" class="btn btn-primary btn-block btn-md" id="analyze-btn" disabled>
+            <svg><use href="#i-spark"/></svg><span data-i18n="analyze">Phân tích video</span>
+          </button>
+        </div>
+
+        <div class="progress-box" id="analyze-progress" hidden>
+          <ol class="stages" id="stages">
+            <li data-stage="prepare"><i></i><span data-i18n="st_prepare">Chuẩn bị video</span></li>
+            <li data-stage="detect"><i></i><span data-i18n="st_detect">Phát hiện &amp; theo vết</span></li>
+            <li data-stage="crops"><i></i><span data-i18n="st_crops">Trích xuất ảnh người</span></li>
+            <li data-stage="encode"><i></i><span data-i18n="st_encode">Mã hóa SpaceTimeViT</span></li>
+          </ol>
+          <div class="bar bar-lg"><i id="analyze-bar"></i></div>
+          <div class="progress-meta">
+            <span id="analyze-pct">0%</span>
+            <span id="analyze-eta"></span>
+            <button type="button" class="link-btn" id="analyze-cancel" data-i18n="cancel">Hủy</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 3: describe -->
+      <section class="card step" id="step-search" data-state="locked">
+        <header class="step-head">
+          <span class="step-num">3</span>
+          <h2 data-i18n="s3_title">Mô tả người cần tìm</h2>
+          <span class="info" data-i18n-title="en_note" title=""><svg><use href="#i-info"/></svg></span>
+        </header>
+        <form id="search-form" class="search-form" autocomplete="off">
+          <div class="prompt-box">
+            <textarea id="prompt" rows="2" maxlength="500" data-i18n-placeholder="prompt_ph" placeholder=""></textarea>
+            <button type="submit" class="search-fab" id="search-btn" disabled data-i18n-title="search_title" title="">
+              <svg><use href="#i-arrow"/></svg>
+            </button>
+          </div>
+          <div class="chips" id="examples"></div>
+        </form>
+
+        <div class="dsca" id="dsca" hidden>
+          <div class="dsca-head">
+            <span class="label" data-i18n="dsca_title">Phân tích truy vấn DSCA</span>
+            <span class="info" data-i18n-title="dsca_info" title=""><svg><use href="#i-info"/></svg></span>
+          </div>
+          <div class="dsca-row app"><span class="dsca-tag">Q<sub>app</sub></span><span class="dsca-text" id="q-app"></span></div>
+          <div class="dsca-row mot"><span class="dsca-tag">Q<sub>mot</sub></span><span class="dsca-text" id="q-mot"></span></div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ============ STAGE ============ -->
+    <section class="stage">
+      <div class="empty card" id="empty-state">
+        <div class="empty-art">
+          <svg><use href="#i-film"/></svg>
+        </div>
+        <h1 data-i18n="empty_title">Tìm một người trong video chỉ bằng lời mô tả</h1>
+        <p data-i18n="empty_sub">Mô hình SpaceTime-DSCA so khớp câu mô tả với ngoại hình và chuyển động của từng người được theo vết trong video.</p>
+        <ol class="how">
+          <li><b>1</b><span data-i18n="how_1">Tải lên hoặc chọn video mẫu</span></li>
+          <li><b>2</b><span data-i18n="how_2">Phân tích một lần: phát hiện, theo vết, mã hóa</span></li>
+          <li><b>3</b><span data-i18n="how_3">Nhập mô tả, đổi mô tả bao nhiêu lần cũng được</span></li>
+        </ol>
+      </div>
+
+      <div class="card player-card" id="player-card" hidden>
+        <div class="player" id="player">
+          <video id="video" playsinline muted preload="auto"></video>
+          <canvas id="overlay"></canvas>
+          <div class="player-busy" id="player-busy" hidden>
+            <div class="spinner"></div>
+            <span id="player-busy-text"></span>
+            <div class="bar"><i id="player-busy-bar"></i></div>
+          </div>
+          <div class="out-of-range" id="out-of-range" hidden data-i18n="out_of_range">Ngoài vùng đã phân tích</div>
+          <div class="tooltip" id="tooltip" hidden></div>
+        </div>
+        <div class="controls">
+          <button type="button" class="icon-btn" id="play-btn" data-i18n-title="play" title="">
+            <svg class="i-play"><use href="#i-play"/></svg><svg class="i-pause"><use href="#i-pause"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="prev-frame" data-i18n-title="prev_frame" title=""><svg><use href="#i-prev"/></svg></button>
+          <button type="button" class="icon-btn" id="next-frame" data-i18n-title="next_frame" title=""><svg><use href="#i-next"/></svg></button>
+          <span class="time mono" id="time-text">00:00.0 / 00:00.0</span>
+          <span class="frame mono" id="frame-text"></span>
+          <span class="spacer"></span>
+          <select id="speed" class="select-sm" aria-label="Speed">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+          </select>
+        </div>
+
+        <div class="timeline" id="timeline">
+          <div class="tl-head">
+            <span class="label" data-i18n="timeline">Dòng thời gian xuất hiện</span>
+            <span class="tl-legend"><i class="hatch"></i><span data-i18n="not_analyzed">chưa phân tích</span></span>
+          </div>
+          <div class="tl-body" id="tl-body">
+            <div class="tl-ruler" id="tl-ruler"></div>
+            <div class="tl-lanes" id="tl-lanes"></div>
+            <div class="tl-playhead" id="tl-playhead"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card results" id="results" hidden>
+        <div class="summary" id="summary"></div>
+        <div class="results-head">
+          <h2><span data-i18n="candidates">Ứng viên</span> <span class="count" id="cand-count"></span></h2>
+          <div class="actions">
+            <button type="button" class="btn btn-ghost" id="render-btn">
+              <svg><use href="#i-download"/></svg><span data-i18n="dl_mp4">Tải MP4 đã đánh dấu</span>
+              <span class="btn-progress" hidden><i></i></span>
+            </button>
+            <button type="button" class="btn btn-ghost" id="report-btn">
+              <svg><use href="#i-file"/></svg><span data-i18n="dl_report">Xuất báo cáo</span>
+            </button>
+          </div>
+        </div>
+        <div class="rank-toolbar" id="rank-toolbar">
+          <div class="wpop-anchor">
+            <button type="button" class="btn btn-ghost btn-sm" id="weights-btn" aria-expanded="false" aria-controls="weights-pop">
+              <svg><use href="#i-sliders"/></svg>
+              <span data-i18n="weights">Trọng số</span>
+              <span class="wbar" aria-hidden="true"><i data-wb="joint"></i><i data-wb="app"></i><i data-wb="mot"></i></span>
+              <span class="mono wtext" id="wtext"></span>
+              <svg class="chev"><use href="#i-chevron"/></svg>
+            </button>
+            <div class="weights-pop" id="weights-pop" role="dialog" hidden>
+              <div class="pop-head">
+                <b data-i18n="tune_title">Tinh chỉnh xếp hạng</b>
+                <span class="tune-live" data-i18n="live">trực tiếp</span>
+                <span class="info" data-i18n-title="tune_hint" title=""><svg><use href="#i-info"/></svg></span>
+                <button type="button" class="pop-close" id="weights-close" aria-label="close"><svg><use href="#i-x"/></svg></button>
+              </div>
+              <div class="weights">
+                <label class="weight" style="--w: var(--c-joint)">
+                  <span><b>joint</b> <small data-i18n="w_joint">T_full ↔ V_video</small></span>
+                  <input type="range" min="0" max="1" step="0.05" data-w="joint">
+                  <output data-wv="joint"></output>
+                </label>
+                <label class="weight" style="--w: var(--c-app)">
+                  <span><b>app</b> <small data-i18n="w_app">ngoại hình</small></span>
+                  <input type="range" min="0" max="1" step="0.05" data-w="app">
+                  <output data-wv="app"></output>
+                </label>
+                <label class="weight" style="--w: var(--c-mot)">
+                  <span><b>mot</b> <small data-i18n="w_mot">chuyển động</small></span>
+                  <input type="range" min="0" max="1" step="0.05" data-w="mot">
+                  <output data-wv="mot"></output>
+                </label>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" id="weights-reset">
+                <svg><use href="#i-reset"/></svg><span data-i18n="reset_w">Mặc định (0.50 / 0.35 / 0.15)</span>
+              </button>
+            </div>
+          </div>
+          <div class="tb-group">
+            <span class="label">Top-K</span>
+            <div class="seg seg-sm" id="topk-seg">
+              <button type="button" data-k="1">1</button>
+              <button type="button" data-k="3">3</button>
+              <button type="button" data-k="5">5</button>
+              <button type="button" data-k="10">10</button>
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="show-all">
+            <span class="track"></span>
+            <span data-i18n="show_all">Hiện cả người ngoài top-K</span>
+          </label>
+        </div>
+        <div class="cands" id="cands"></div>
+        <p class="note" data-i18n="score_note">Điểm = độ tương đồng cosine văn bản–video. Xác suất khớp = softmax(điểm / 0.07) trên các người trong video này.</p>
+      </div>
+
+      <div class="card no-person" id="no-person" hidden>
+        <svg><use href="#i-user"/></svg>
+        <h2 data-i18n="no_person">Không phát hiện người nào</h2>
+        <p data-i18n="no_person_sub">Thử giảm ngưỡng phát hiện, tăng số frame hoặc chọn video khác.</p>
+      </div>
+    </section>
+  </main>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

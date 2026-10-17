@@ -17,6 +17,7 @@ uploads/
 *.avi
 *.mov
 *.mkv
+*.webm
 
 # 3. Python Caches & Bytecode
 __pycache__/
@@ -32,6 +33,7 @@ __pycache__/
 # 5. Environment & Virtualenv
 env/
 venv/
+.venv/
 .env
 
 # 6. IDE & OS Metadata

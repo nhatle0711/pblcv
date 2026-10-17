@@ -222,6 +222,8 @@ Trong nghiên cứu khoa học, **Ablation Study** là bước bắt buộc đ�
 
 ## 6. Hướng Dẫn Sử Dụng & Huấn Luyện
 
+> 🚀 **Cài đặt từ đầu và chạy Web Demo trên Windows** (kèm tải checkpoint): xem **[INSTALL.md](INSTALL.md)**.
+
 ### 6.1. Huấn luyện mô hình từ đầu
 ```bash
 # Huấn luyện trên TVPReid-PRID

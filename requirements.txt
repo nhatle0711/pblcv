@@ -1,0 +1,17 @@
+# Core (train.py / test.py)
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40,<5
+pyyaml
+numpy
+pandas
+opencv-python
+pillow
+matplotlib
+
+# Web demo (web_demo.py)
+fastapi
+uvicorn
+python-multipart
+imageio-ffmpeg        # bundled ffmpeg for H.264 proxies/renders
+ultralytics
