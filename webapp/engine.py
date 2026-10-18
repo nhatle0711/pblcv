@@ -10,6 +10,9 @@ train.py::evaluate (0.50 joint / 0.35 app / 0.15 mot).
 
 import base64
 import math
+import os
+import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +32,88 @@ DEFAULT_WEIGHTS = {"joint": 0.50, "app": 0.35, "mot": 0.15}
 NUM_TRACK_FRAMES = 16
 CROP_SIZE = 224
 ENCODE_BATCH = 4
-MAX_TRACK_GAP = 15          # frames a track survives without a matching detection
-MIN_TRACK_DETECTIONS = 3
 SOFTMAX_TAU = 0.07          # same temperature as the InfoNCE training loss
+
+# --- tracking (YOLO + BoT-SORT with native ReID) ---
+TRACKER_VERSION = "botsort-reid-v5-split"   # part of the analysis cache key; bump when analysis output changes
+DETECT_IMGSZ = 960          # upscaled inference finds small, distant people in crowds (Accurate mode)
+DETECT_IMGSZ_FAST = 640     # Balanced/Fast modes: skips tiny far-away people -> fewer tracks to encode
+DETECT_CONF_LOW = 0.1       # low-score boxes feed BoT-SORT's second association stage
+TRACK_BUFFER_S = 2.0        # seconds a lost track is kept for re-association
+MAX_INTERP_GAP_S = 2.0      # fill boxes across gaps up to this long
+MIN_TRACK_DETECTIONS = 12   # drop tracks seen fewer times than this (~0.5s at 25 fps)
+MIN_TRACK_HEIGHT = 40       # px; median box height below this gives useless crops
+
+# --- tracklet stitching with the model's own appearance embedding (V_app) ---
+STITCH_MAX_GAP_S = 8.0      # max time between the end of A and the start of B (occlusion length)
+STITCH_SPEED = 1.5          # max movement in box-heights per second (plus half a height of slack)
+STITCH_MIN_SIM = 0.92       # fallback without the re-ID model: cosine(V_app_A, V_app_B) (different people peak ~0.92)
+REID_MODEL = "person-reidentification-retail-0277"   # OpenVINO person re-ID, 256-D embedding of a 256x128 crop
+REID_MIN_SIM = 0.60         # cosine of mean re-ID embeddings to join tracklets; on a crowded station clip different
+                            # people p99 ~0.40, the same person median ~0.79; 0.52-0.56 produced visible wrong joins
+REID_SAMPLE_S = 0.25        # during tracking, one re-ID sample per track every this many seconds...
+REID_SAMPLE_MAX_OCCL = 0.3  # ...only from detections with at most this much overlap with other boxes
+SPLIT_MAX_SIM = 0.40        # split a track where the mean re-ID embeddings before/after differ this much
+SPLIT_MIN_SAMPLES = 2       # samples needed on each side of a split
+STITCH_GENDER_GAP = 0.6     # never join tracklets whose P(male) differ by more than this
+
+# --- pedestrian attributes (gender etc.) with OpenVINO person-attributes-recognition-crossroad-0230 ---
+ATTR_MODEL = "person-attributes-recognition-crossroad-0230"
+OMZ_URL = "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/{0}/FP32/{0}"
+ATTR_NAMES = ["male", "bag", "backpack", "hat", "longsleeves", "longpants", "longhair", "coat"]
+MALE_WORDS = {"man", "men", "male", "males", "guy", "guys", "boy", "boys", "gentleman", "gentlemen", "he", "him", "his"}
+FEMALE_WORDS = {"woman", "women", "female", "females", "lady", "ladies", "girl", "girls", "she", "her", "hers"}
+POSE_MODEL = "yolov8n-pose.pt"  # shoulders/hips/knees locate the top & bottom garment inside each crop
+
+# Query constraints matched against the attribute model; fused -= weight * (1 - p_match). Gender 0.3 put 42/48
+# top-8 results on the right gender in tests; the others are smaller because those attributes are less reliable.
+CONSTRAINT_WEIGHTS = {"gender": 0.30, "top_color": 0.25, "bottom_color": 0.20, "backpack": 0.15, "bag": 0.10,
+                      "hat": 0.15, "coat": 0.10, "longsleeves": 0.10, "longpants": 0.10, "longhair": 0.15}
+LOOSE_COLOR_WEIGHT = 0.15   # "a man in red" (color without a garment) -> top_color with this weight
+ATTR_PATTERNS = {           # key -> (regex meaning "yes", regex meaning "no")
+    "backpack": (r"\b(backpacks?|rucksacks?)\b", None),
+    "bag": (r"\b(bags?|handbags?|purses?|totes?)\b", None),
+    "hat": (r"\b(hats?|caps?|beanies?|helmets?)\b", None),
+    "coat": (r"\b(coats?|jackets?|overcoats?|parkas?|blazers?)\b", None),
+    "longsleeves": (r"\blong[- ]?sleeve[ds]?\b", r"\b(short[- ]?sleeve[ds]?|sleeveless|t-?shirts?|tees?|tank tops?)\b"),
+    "longpants": (r"\b(pants|trousers|jeans|leggings|sweatpants)\b", r"\bshorts\b"),
+    "longhair": (r"\b(long[- ]hair(ed)?|ponytail)\b", r"\b(short[- ]hair(ed)?|bald)\b"),
+}
+TOP_GARMENTS = {"shirt", "shirts", "t-shirt", "tshirt", "tee", "top", "jacket", "coat", "sweater", "hoodie", "blouse",
+                "vest", "dress", "suit", "cardigan", "blazer", "jumper", "sweatshirt", "polo", "parka", "overcoat"}
+BOTTOM_GARMENTS = {"pants", "trousers", "jeans", "shorts", "skirt", "leggings", "sweatpants"}
+OTHER_ITEMS = {"bag", "bags", "backpack", "handbag", "purse", "hat", "cap", "shoes", "sneakers", "boots", "hair",
+               "umbrella", "suitcase", "glasses", "sunglasses", "helmet", "beanie", "scarf", "mask", "socks"}
+COLOR_ALIASES = {"black": "black", "white": "white", "grey": "grey", "gray": "grey", "silver": "grey",
+                 "red": "red", "maroon": "red", "burgundy": "red", "orange": "orange", "yellow": "yellow",
+                 "gold": "yellow", "green": "green", "olive": "green", "blue": "blue", "navy": "blue",
+                 "denim": "blue", "turquoise": "blue", "teal": "blue",
+                 "cyan": "blue", "purple": "purple", "violet": "purple", "pink": "pink", "brown": "brown",
+                 "beige": "beige", "khaki": "beige", "tan": "beige", "cream": "beige"}
+COLOR_MODIFIERS = {"dark", "light", "bright", "pale", "deep", "and", "or", "/"}
+# A few sRGB prototypes per colour name; pixels are assigned to the nearest one in (weighted) Lab space.
+COLOR_PROTOS = {
+    "black": [(20, 20, 20), (45, 45, 50)],
+    "white": [(240, 240, 240), (210, 210, 215)],
+    "grey": [(128, 128, 128), (95, 95, 100), (170, 170, 172)],
+    "red": [(200, 30, 35), (135, 20, 30)],
+    "orange": [(240, 130, 30)],
+    "yellow": [(235, 210, 40)],
+    "green": [(40, 140, 60), (75, 85, 45)],
+    "blue": [(40, 80, 190), (30, 40, 90), (110, 150, 205),
+             (55, 70, 100), (140, 160, 190), (60, 165, 175)],   # + dark/light denim, turquoise
+    "purple": [(120, 50, 140), (90, 60, 120)],
+    "pink": [(240, 140, 180), (215, 90, 140)],
+    "brown": [(110, 70, 40), (80, 55, 40)],
+    "beige": [(215, 195, 160), (185, 165, 125)],
+}
+COLOR_NAMES = list(COLOR_PROTOS)
+COLOR_SIM = {("grey", "black"): 0.5, ("grey", "white"): 0.5, ("brown", "beige"): 0.5, ("brown", "orange"): 0.4,
+             ("pink", "red"): 0.5, ("purple", "pink"): 0.4, ("purple", "blue"): 0.4, ("beige", "white"): 0.4,
+             ("yellow", "orange"): 0.5, ("beige", "yellow"): 0.3, ("brown", "black"): 0.3, ("red", "orange"): 0.3}
+
+# Legacy greedy tracker (only for the non-YOLO fallback detectors)
+MAX_TRACK_GAP = 15
 
 # Distinct rank colours shared by the rendered MP4 (BGR) and the web UI (hex)
 RANK_COLORS = [
@@ -78,11 +160,160 @@ def _iou(a: List[int], b: List[int]) -> float:
     return inter / max(union, 1e-6)
 
 
+def _max_overlap(xyxy: np.ndarray) -> np.ndarray:
+    """For each box, the largest fraction of its area covered by any other box in the same frame."""
+    n = len(xyxy)
+    if n < 2:
+        return np.zeros(n)
+    x1, y1, x2, y2 = (xyxy[:, i] for i in range(4))
+    iw = np.clip(np.minimum(x2[:, None], x2[None]) - np.maximum(x1[:, None], x1[None]), 0, None)
+    ih = np.clip(np.minimum(y2[:, None], y2[None]) - np.maximum(y1[:, None], y1[None]), 0, None)
+    cover = iw * ih / np.maximum((x2 - x1) * (y2 - y1), 1e-6)[:, None]
+    np.fill_diagonal(cover, 0)
+    return np.clip(cover.max(axis=1), 0, 1)
+
+
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    """[N, 3] uint8 RGB -> [N, 3] float Lab (L 0..100), with L down-weighted so shading matters less than hue."""
+    lab = cv2.cvtColor(rgb.reshape(-1, 1, 3).astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab).reshape(-1, 3)
+    return lab * np.array([0.6, 1.0, 1.0], dtype=np.float32)
+
+
+_PROTO_LAB = _lab(np.array([c for n in COLOR_NAMES for c in COLOR_PROTOS[n]], dtype=np.uint8))
+_PROTO_IDX = np.array([i for i, n in enumerate(COLOR_NAMES) for _ in COLOR_PROTOS[n]])
+
+
+def _color_hist(region_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """Fraction of the region's pixels nearest to each colour name (len(COLOR_NAMES),), or None if too small."""
+    if region_bgr is None or region_bgr.shape[0] < 3 or region_bgr.shape[1] < 3:
+        return None
+    if region_bgr.shape[0] * region_bgr.shape[1] > 900:
+        region_bgr = cv2.resize(region_bgr, (30, 30), interpolation=cv2.INTER_AREA)
+    lab = _lab(cv2.cvtColor(region_bgr, cv2.COLOR_BGR2RGB).reshape(-1, 3))
+    nearest = _PROTO_IDX[((lab[:, None] - _PROTO_LAB[None]) ** 2).sum(-1).argmin(1)]
+    return np.bincount(nearest, minlength=len(COLOR_NAMES)) / len(nearest)
+
+
+def _garment_regions(kp: Optional[np.ndarray], w: int, h: int, top_pt, bottom_pt):
+    """
+    Top/bottom garment boxes inside a crop of size (w, h). kp: COCO keypoints [17, 3] in crop coordinates.
+    Uses shoulders -> hips for the top and hips -> knees for the bottom; the bottom is None when the hips are
+    not visible (crop shows only the upper body). Falls back to the attribute model's colour points.
+    """
+    def box(x1, y1, x2, y2):
+        x1, x2 = int(max(0, min(x1, x2))), int(min(w, max(x1, x2)))
+        y1, y2 = int(max(0, min(y1, y2))), int(min(h, max(y1, y2)))
+        return (x1, y1, x2, y2) if x2 - x1 >= 3 and y2 - y1 >= 3 else None
+
+    vis = (lambda i: kp is not None and kp[i, 2] > 0.5)
+    top = bottom = None
+    if vis(5) and vis(6):
+        sx1, sx2 = sorted((kp[5, 0], kp[6, 0]))
+        sw = max(sx2 - sx1, 0.2 * w)
+        sy = (kp[5, 1] + kp[6, 1]) / 2
+        hips = [i for i in (11, 12) if vis(i)]
+        hy = float(np.mean([kp[i, 1] for i in hips])) if hips else min(h, sy + 1.5 * sw)
+        L = max(hy - sy, 1.0)
+        top = box(sx1 + 0.15 * sw, sy + 0.15 * L, sx2 - 0.15 * sw, hy - 0.1 * L)
+        if hips:
+            hx = [kp[i, 0] for i in hips]
+            hx1, hx2 = min(hx), max(hx)
+            hw = max(hx2 - hx1, 0.5 * sw)
+            cx = (hx1 + hx2) / 2
+            knees = [i for i in (13, 14) if vis(i)]
+            ky = float(np.mean([kp[i, 1] for i in knees])) if knees else min(h, hy + 0.9 * L)
+            if ky - hy >= 0.4 * L:
+                Lb = ky - hy
+                bottom = box(cx - 0.6 * hw, hy + 0.1 * Lb, cx + 0.6 * hw, ky - 0.05 * Lb)
+    elif top_pt is not None:
+        tx, ty = top_pt[0] * w, top_pt[1] * h
+        top = box(tx - 0.15 * w, ty - 0.06 * h, tx + 0.15 * w, ty + 0.06 * h)
+    return top, bottom
+
+
+def _parse_colors(words: List[str], i: int) -> List[str]:
+    """Colour names directly before position i ("dark blue", "black and white")."""
+    out, j = [], i - 1
+    while j >= 0 and (words[j] in COLOR_ALIASES or words[j] in COLOR_MODIFIERS):
+        if words[j] in COLOR_ALIASES:
+            out.append(COLOR_ALIASES[words[j]])
+        j -= 1
+    return out
+
+
+def query_attributes(prompt: str) -> List[Dict[str, Any]]:
+    """
+    Structured constraints found in the prompt: gender, garment colours and attribute-model attributes.
+    Each is {"key", "value", "weight"}; value is "male"/"female", a list of colour names, or True/False.
+    """
+    text = prompt.lower()
+    words = re.findall(r"[a-z]+(?:-[a-z]+)?|/", text)
+    wset = set(words)
+    out: List[Dict[str, Any]] = []
+
+    male, female = bool(wset & MALE_WORDS), bool(wset & FEMALE_WORDS)
+    if male != female:
+        out.append({"key": "gender", "value": "male" if male else "female", "weight": CONSTRAINT_WEIGHTS["gender"]})
+
+    top_c, bottom_c, loose, used = [], [], [], set()
+    for i, wd in enumerate(words):
+        if wd in TOP_GARMENTS or wd in BOTTOM_GARMENTS or wd in OTHER_ITEMS:
+            cols = _parse_colors(words, i)
+            for j in range(max(0, i - 4), i):
+                used.add(j)
+            (top_c if wd in TOP_GARMENTS else bottom_c if wd in BOTTOM_GARMENTS else []).extend(cols)
+    for i, wd in enumerate(words):
+        if wd in COLOR_ALIASES and i not in used:
+            loose.append(COLOR_ALIASES[wd])
+    if top_c:
+        out.append({"key": "top_color", "value": sorted(set(top_c)), "weight": CONSTRAINT_WEIGHTS["top_color"]})
+    elif loose:
+        out.append({"key": "top_color", "value": sorted(set(loose)), "weight": LOOSE_COLOR_WEIGHT})
+    if bottom_c:
+        out.append({"key": "bottom_color", "value": sorted(set(bottom_c)), "weight": CONSTRAINT_WEIGHTS["bottom_color"]})
+
+    for key, (yes, no) in ATTR_PATTERNS.items():
+        if re.search(yes, text):
+            out.append({"key": key, "value": True, "weight": CONSTRAINT_WEIGHTS[key]})
+        elif no and re.search(no, text):
+            out.append({"key": key, "value": False, "weight": CONSTRAINT_WEIGHTS[key]})
+    return out
+
+
+def _color_match(dist: Optional[Dict[str, float]], wanted: List[str]) -> Optional[float]:
+    """How well a colour distribution matches any wanted colour, 0..1 (1 = the dominant colour)."""
+    if not dist:
+        return None
+    top = max(dist.values()) or 1.0
+    best = 0.0
+    for c in wanted:
+        for k, v in dist.items():
+            sim = 1.0 if k == c else COLOR_SIM.get((c, k), COLOR_SIM.get((k, c), 0.0))
+            best = max(best, sim * v / top)
+    return min(1.0, best)
+
+
+def constraint_p(track: "Track", c: Dict[str, Any]) -> Optional[float]:
+    """Probability that the track satisfies one query constraint (None when the track has no such information)."""
+    key, val = c["key"], c["value"]
+    if key == "gender":
+        p = track.attrs.get("male")
+        return None if p is None else (p if val == "male" else 1.0 - p)
+    if key in ("top_color", "bottom_color"):
+        return _color_match(track.attrs.get(key), val)
+    p = track.attrs.get(key)
+    return None if p is None else (p if val else 1.0 - p)
+
+
 @dataclass
 class Track:
     id: int
     boxes: Dict[int, List[int]]          # frame -> [x1, y1, x2, y2], incl. interpolated gaps
     det_frames: List[int]                # frames with a real detection
+    quality: Dict[int, float] = field(default_factory=dict)  # det frame -> crop quality (conf, occlusion, size)
+    attrs: Dict[str, Any] = field(default_factory=dict)      # male/backpack/... -> prob; top_color/bottom_color -> {colour: frac}
+    reid: Optional[np.ndarray] = None    # L2-normalised mean re-ID embedding (tracking samples or preview crops)
+    reid_n: int = 0                      # number of samples behind `reid` (weights merges)
     clip: Optional[np.ndarray] = None    # [16, 224, 224, 3] RGB uint8, model input
     thumb: bytes = b""                   # JPEG, representative crop
     film: List[bytes] = field(default_factory=list)  # 4 JPEG crops across the track
@@ -110,6 +341,8 @@ class Analysis:
     ckpt_key: str = ""
     emb: Dict[str, torch.Tensor] = field(default_factory=dict)  # V_app/V_mot/V_video [N, D], L2-normalised
     track_order: List[int] = field(default_factory=list)          # row order of emb
+    track_emb: Dict[int, Dict[str, torch.Tensor]] = field(default_factory=dict)  # per-track V_* rows
+    stitch_log: List[Dict[str, Any]] = field(default_factory=list)  # re-ID merges (for inspection)
 
 
 class SearchEngine:
@@ -139,6 +372,7 @@ class SearchEngine:
                   "untrained model and checkpoints will not match. Check HF_HOME / network access.")
         self._load_default_checkpoint()
         self._init_detector()
+        self._init_attr_model()
 
     # ------------------------------------------------------------------ checkpoints
     def scan_checkpoints(self) -> List[Dict[str, Any]]:
@@ -261,6 +495,131 @@ class SearchEngine:
                 boxes.append([x1, y1, x2, y2])
         return boxes
 
+    # ------------------------------------------------------------------ attributes
+    def _ov_model(self, name: str, folder: str, size_mb: int, dynamic_batch: bool = False):
+        """Compiles an Open Model Zoo IR from checkpoints/<folder>/, downloading it once. Raises on failure."""
+        import openvino as ov
+        xml = self.checkpoints_dir / folder / f"{name}.xml"
+        if not xml.exists() or not xml.with_suffix(".bin").exists():
+            import urllib.request
+            xml.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[*] Downloading {name} (~{size_mb} MB)...")
+            for ext in (".xml", ".bin"):
+                tmp = xml.with_suffix(ext + ".part")
+                urllib.request.urlretrieve(OMZ_URL.format(name) + ext, tmp)
+                tmp.replace(xml.with_suffix(ext))
+        core = ov.Core()
+        model = core.read_model(str(xml))
+        if dynamic_batch:
+            shape = list(model.input(0).shape)
+            model.reshape([-1, *shape[1:]])
+        device = "GPU" if "GPU" in core.available_devices else "CPU"
+        return core.compile_model(model, device), device
+
+    def _init_attr_model(self) -> None:
+        """OpenVINO pedestrian-attribute and re-ID models, pose model for garment regions. All optional."""
+        self.attr_model = self.reid_model = self.pose_model = None
+        try:
+            import openvino  # noqa: F401
+        except ImportError:
+            print("[!] openvino not installed: attribute recognition and re-ID disabled.")
+            return
+        try:
+            self.reid_model, device = self._ov_model(REID_MODEL, "reid", 8, dynamic_batch=True)
+            print(f"[+] Re-ID model: {REID_MODEL} on {device}")
+        except Exception as e:
+            print(f"[!] Re-ID model unavailable ({e}): tracklet stitching falls back to V_app similarity.")
+        try:
+            self.attr_model, device = self._ov_model(ATTR_MODEL, "attributes", 3)
+            self.attr_output = self.attr_model.output("453")
+            self.attr_points = (self.attr_model.output("456"), self.attr_model.output("459"))
+            print(f"[+] Attribute model: {ATTR_MODEL} on {device}")
+        except Exception as e:
+            print(f"[!] Attribute model unavailable ({e}): gender/attribute recognition disabled.")
+            self.attr_model = None
+            return
+        try:
+            from ultralytics import YOLO
+            self.pose_model = YOLO(str(self.checkpoints_dir / POSE_MODEL))
+            print(f"[+] Pose model: {POSE_MODEL} (garment colour regions)")
+        except Exception as e:
+            print(f"[!] Pose model unavailable ({e}): colours fall back to the attribute model's colour points.")
+
+    def _embed_reid(self, crops: List[np.ndarray]) -> np.ndarray:
+        """[N, 256] L2-normalised re-ID embeddings of BGR crops."""
+        x = np.stack([cv2.resize(c, (128, 256)).transpose(2, 0, 1) for c in crops]).astype(np.float32)
+        with self.model_lock:
+            v = self.reid_model([x])[self.reid_model.output(0)]
+        return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-6)
+
+    def _reid(self, analysis: Analysis, tids: List[int]) -> None:
+        """Fallback re-ID embedding from the preview crops, for tracks without samples taken during tracking."""
+        if self.reid_model is None:
+            return
+        for tid in tids:
+            t = analysis.tracks[tid]
+            if t.reid is not None:
+                continue
+            crops = [img for j in t.film + ([t.thumb] if t.thumb else [])
+                     if (img := cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR)) is not None]
+            if not crops:
+                continue
+            m = self._embed_reid(crops).mean(axis=0)
+            t.reid, t.reid_n = m / max(float(np.linalg.norm(m)), 1e-6), len(crops)
+
+    def _pose_keypoints(self, crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
+        """COCO keypoints [17, 3] (crop coordinates) of the person filling each crop, or None."""
+        if getattr(self, "pose_model", None) is None or not crops:
+            return [None] * len(crops)
+        padded, pads = [], []
+        for c in crops:
+            pad = int(0.3 * c.shape[0])   # context so a tightly cropped person is still detected
+            padded.append(cv2.copyMakeBorder(c, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(114, 114, 114)))
+            pads.append(pad)
+        with self.model_lock:
+            results = self.pose_model(padded, imgsz=320, verbose=False)
+        out = []
+        for c, pad, r in zip(crops, pads, results):
+            if r.keypoints is None or not len(r.boxes):
+                out.append(None)
+                continue
+            h, w = c.shape[:2]
+            target = [pad, pad, pad + w, pad + h]
+            ious = [_iou([int(v) for v in b], target) for b in r.boxes.xyxy.cpu().numpy()]
+            k = r.keypoints.data[int(np.argmax(ious))].cpu().numpy().copy()
+            k[:, :2] -= pad
+            out.append(k)
+        return out
+
+    def _attributes(self, analysis: Analysis, tids: List[int]) -> None:
+        """
+        Per track, over its preview crops (least-occluded frames): averages the 8 attribute probabilities and
+        builds top/bottom garment colour distributions from pose-located regions.
+        """
+        if self.attr_model is None:
+            return
+        for tid in tids:
+            t = analysis.tracks[tid]
+            crops = [img for j in t.film + ([t.thumb] if t.thumb else [])
+                     if (img := cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR)) is not None]
+            if not crops:
+                continue
+            probs, hists = [], {"top_color": [], "bottom_color": []}
+            for img, kp in zip(crops, self._pose_keypoints(crops)):
+                x = cv2.resize(img, (80, 160)).transpose(2, 0, 1)[None].astype(np.float32)  # BGR, NCHW, 0..255
+                res = self.attr_model([x])
+                probs.append(res[self.attr_output].reshape(-1))
+                h, w = img.shape[:2]
+                regions = _garment_regions(kp, w, h, res[self.attr_points[0]].reshape(-1), res[self.attr_points[1]].reshape(-1))
+                for key, r in zip(("top_color", "bottom_color"), regions):
+                    hist = _color_hist(img[r[1]:r[3], r[0]:r[2]]) if r else None
+                    if hist is not None:
+                        hists[key].append(hist)
+            t.attrs = {k: float(v) for k, v in zip(ATTR_NAMES, np.mean(probs, axis=0))}
+            for key, hs in hists.items():
+                if hs:
+                    t.attrs[key] = {c: round(float(v), 4) for c, v in zip(COLOR_NAMES, np.mean(hs, axis=0))}
+
     # ------------------------------------------------------------------ analysis
     def analyze(self, video_path: Path, video_id: str, analysis_id: str, params: Dict[str, Any],
                 progress: ProgressCb) -> Analysis:
@@ -276,17 +635,170 @@ class SearchEngine:
         stride = max(1, int(params.get("stride", 1)))
         conf = float(params.get("conf", 0.35))
 
-        # Pass 1: detect + associate. Only boxes are kept, never full frames.
+        # Pass 1: detect + track. Only boxes and per-detection quality are kept, never frames.
+        if self.detector_backend == "yolo":
+            raw, frames_processed = self._track_botsort(cap, n_frames, stride, conf, fps, progress)
+        else:
+            raw, frames_processed = self._track_greedy(cap, n_frames, stride, conf, progress)
+        cap.release()
+        raw = self._split_by_appearance(raw)
+
+        max_gap = int(MAX_INTERP_GAP_S * fps)
+        kept = []
+        for t in raw.values():
+            dets = sorted(t["boxes"])
+            heights = [t["boxes"][f][3] - t["boxes"][f][1] for f in dets]
+            if len(dets) < MIN_TRACK_DETECTIONS or float(np.median(heights)) < MIN_TRACK_HEIGHT:
+                continue
+            boxes = dict(t["boxes"])
+            for f0, f1 in zip(dets, dets[1:]):
+                if 1 < f1 - f0 <= max_gap:
+                    b0, b1 = boxes[f0], boxes[f1]
+                    for gf in range(f0 + 1, f1):
+                        a = (gf - f0) / float(f1 - f0)
+                        boxes[gf] = [int(b0[k] + a * (b1[k] - b0[k])) for k in range(4)]
+            track = Track(id=0, boxes=boxes, det_frames=dets, quality=t["q"])
+            if t.get("emb"):
+                m = np.mean([v for _, v in t["emb"]], axis=0)
+                track.reid, track.reid_n = m / max(float(np.linalg.norm(m)), 1e-6), len(t["emb"])
+            kept.append(track)
+        kept.sort(key=lambda t: t.start)
+        tracks = {}
+        for i, t in enumerate(kept, start=1):
+            t.id = i
+            tracks[i] = t
+
+        analysis = Analysis(
+            id=analysis_id, video_id=video_id, params=params, fps=float(fps), width=width, height=height,
+            frames_processed=frames_processed, frames_total=total or frames_processed, tracks=tracks,
+        )
+        if tracks:
+            self._extract_crops(video_path, analysis, list(tracks), progress)
+            self._attributes(analysis, list(tracks))
+            self._reid(analysis, list(tracks))
+            self.encode_tracks(analysis, progress=progress)
+            self._stitch(video_path, analysis, progress)
+        return analysis
+
+    @staticmethod
+    def _split_by_appearance(raw: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        """
+        Fixes identity switches inside a track: when the tracker's box jumps to another person (typically
+        while they cross and occlude each other), the re-ID samples before and after the switch disagree.
+        Recursively cuts each track at the sample boundary with the lowest cosine between the mean embeddings
+        of the two sides, while that cosine is below SPLIT_MAX_SIM. The pieces are re-joined by _stitch.
+        """
+        def norm_mean(vs):
+            m = np.mean(vs, axis=0)
+            return m / max(float(np.linalg.norm(m)), 1e-6)
+
+        def cuts(samples):
+            n = len(samples)
+            if n < 2 * SPLIT_MIN_SAMPLES:
+                return []
+            vs = np.stack([v for _, v in samples])
+            best_k, best_sim = None, SPLIT_MAX_SIM
+            for k in range(SPLIT_MIN_SAMPLES, n - SPLIT_MIN_SAMPLES + 1):
+                sim = float(norm_mean(vs[:k]) @ norm_mean(vs[k:]))
+                if sim < best_sim:
+                    best_k, best_sim = k, sim
+            if best_k is None:
+                return []
+            return cuts(samples[:best_k]) + [samples[best_k][0]] + cuts(samples[best_k:])
+
+        out: Dict[int, Dict[str, Any]] = {}
+        next_id = max(raw, default=0) + 1
+        for tid, t in raw.items():
+            starts = cuts(t.get("emb", []))
+            if not starts:
+                out[tid] = t
+                continue
+            bounds = [-1] + starts + [10 ** 9]
+            for lo, hi in zip(bounds, bounds[1:]):
+                part = {"boxes": {f: b for f, b in t["boxes"].items() if lo <= f < hi},
+                        "q": {f: q for f, q in t["q"].items() if lo <= f < hi},
+                        "emb": [(f, v) for f, v in t["emb"] if lo <= f < hi]}
+                if part["boxes"]:
+                    out[next_id] = part
+                    next_id += 1
+        return out
+
+    def _track_botsort(self, cap, n_frames: int, stride: int, conf: float, fps: float,
+                       progress: ProgressCb) -> Tuple[Dict[int, Dict[str, Any]], int]:
+        """YOLO + BoT-SORT: Kalman motion, two-stage (high/low score) Hungarian matching, native ReID."""
+        cfg = (
+            "tracker_type: botsort\n"
+            f"track_high_thresh: {conf}\n"
+            f"track_low_thresh: {DETECT_CONF_LOW}\n"
+            f"new_track_thresh: {conf}\n"
+            # BYTETracker scales track_buffer by frame_rate / 30; calls happen every `stride` frames
+            f"track_buffer: {max(10, int(TRACK_BUFFER_S * 30 / stride))}\n"
+            "match_thresh: 0.8\n"
+            "fuse_score: True\n"
+            "gmc_method: none\n"           # surveillance cameras are static
+            "proximity_thresh: 0.5\n"
+            "appearance_thresh: 0.8\n"
+            "with_reid: True\n"
+            "model: auto\n"                # ReID features straight from the detector, no extra model
+        )
+        fd, cfg_path = tempfile.mkstemp(suffix=".yaml", prefix="botsort_")
+        with os.fdopen(fd, "w") as f:
+            f.write(cfg)
+
         tracks: Dict[int, Dict[str, Any]] = {}
-        next_tid = 1
-        idx = 0
+        idx, first = 0, True
+        sample_every = max(stride, int(round(REID_SAMPLE_S * fps)))
+        try:
+            while idx < n_frames:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if idx % stride == 0:
+                    res = self.detector.track(frame, persist=not first, tracker=cfg_path, conf=DETECT_CONF_LOW,
+                                              imgsz=DETECT_IMGSZ if stride == 1 else DETECT_IMGSZ_FAST,
+                                              classes=[0], verbose=False)[0]
+                    first = False
+                    b = res.boxes
+                    if b is not None and b.id is not None and len(b):
+                        xyxy = b.xyxy.cpu().numpy()
+                        ids = b.id.int().cpu().tolist()
+                        scores = b.conf.cpu().numpy()
+                        occl = _max_overlap(xyxy)
+                        h_img, w_img = frame.shape[:2]
+                        to_embed = []
+                        for (x1, y1, x2, y2), tid, s, oc in zip(xyxy, ids, scores, occl):
+                            box = [max(0, int(x1)), max(0, int(y1)), min(w_img, int(x2)), min(h_img, int(y2))]
+                            if box[2] - box[0] < 8 or box[3] - box[1] < 16:
+                                continue
+                            t = tracks.setdefault(tid, {"boxes": {}, "q": {}, "emb": []})
+                            t["boxes"][idx] = box
+                            t["q"][idx] = float(s) * (1.0 - float(oc)) * min(1.0, (box[3] - box[1]) / 120.0)
+                            if (self.reid_model is not None and oc <= REID_SAMPLE_MAX_OCCL
+                                    and box[3] - box[1] >= MIN_TRACK_HEIGHT
+                                    and (not t["emb"] or idx - t["emb"][-1][0] >= sample_every)):
+                                to_embed.append((tid, frame[box[1]:box[3], box[0]:box[2]]))
+                        if to_embed:
+                            for (tid, _), v in zip(to_embed, self._embed_reid([c for _, c in to_embed])):
+                                tracks[tid]["emb"].append((idx, v))
+                idx += 1
+                if idx % 5 == 0 or idx == n_frames:
+                    progress("detect", idx, n_frames)
+        finally:
+            os.unlink(cfg_path)
+        return tracks, idx
+
+    def _track_greedy(self, cap, n_frames: int, stride: int, conf: float,
+                      progress: ProgressCb) -> Tuple[Dict[int, Dict[str, Any]], int]:
+        """Fallback IoU/centre tracker for the torchvision and HOG detectors (no track ids of their own)."""
+        tracks: Dict[int, Dict[str, Any]] = {}
+        next_tid, idx = 1, 0
         while idx < n_frames:
             ok, frame = cap.read()
             if not ok:
                 break
             detections = self.detect(frame, conf) if idx % stride == 0 else []
             matched = set()
-            for tid, t in tracks.items():
+            for t in tracks.values():
                 if idx - t["last"] > MAX_TRACK_GAP:
                     continue
                 last = t["boxes"][t["last"]]
@@ -295,62 +807,46 @@ class SearchEngine:
                     if d_i in matched:
                         continue
                     iou = _iou(last, det)
-                    dist = math.hypot((last[0] + last[2] - det[0] - det[2]) / 2,
-                                      (last[1] + last[3] - det[1] - det[3]) / 2)
-                    diag = math.hypot(det[2] - det[0], det[3] - det[1])
-                    score = iou + max(0.0, 1.0 - dist / max(diag, 20))
-                    if (iou > 0.15 or dist < diag * 0.9) and score > best:
-                        best, best_d = score, d_i
+                    if iou > 0.3 and iou > best:
+                        best, best_d = iou, d_i
                 if best_d >= 0:
-                    det = detections[best_d]
                     matched.add(best_d)
-                    gap = idx - t["last"]
-                    for gf in range(t["last"] + 1, idx):
-                        a = (gf - t["last"]) / float(gap)
-                        t["boxes"][gf] = [int(last[k] + a * (det[k] - last[k])) for k in range(4)]
-                    t["boxes"][idx] = det
-                    t["dets"].append(idx)
+                    t["boxes"][idx] = detections[best_d]
+                    t["q"][idx] = 1.0
                     t["last"] = idx
             for d_i, det in enumerate(detections):
                 if d_i not in matched:
-                    tracks[next_tid] = {"boxes": {idx: det}, "dets": [idx], "last": idx}
+                    tracks[next_tid] = {"boxes": {idx: det}, "q": {idx: 1.0}, "last": idx}
                     next_tid += 1
             idx += 1
             if idx % 5 == 0 or idx == n_frames:
                 progress("detect", idx, n_frames)
-        cap.release()
-        frames_processed = idx
+        return tracks, idx
 
-        valid = [t for t in tracks.values() if len(t["dets"]) >= MIN_TRACK_DETECTIONS]
-        valid.sort(key=lambda t: min(t["boxes"]))
-        result_tracks = {
-            i: Track(id=i, boxes=t["boxes"], det_frames=t["dets"]) for i, t in enumerate(valid, start=1)
-        }
+    def _pick_clip_frames(self, t: Track) -> List[int]:
+        """16 frames spread over the track; in each time bin take the best-quality (least occluded) detection."""
+        dets = t.det_frames
+        if len(dets) <= NUM_TRACK_FRAMES:
+            return [dets[i] for i in np.linspace(0, len(dets) - 1, NUM_TRACK_FRAMES).round().astype(int)]
+        bins = np.array_split(np.array(dets), NUM_TRACK_FRAMES)
+        return [int(max(b, key=lambda f: t.quality.get(int(f), 0.0))) for b in bins]
 
-        analysis = Analysis(
-            id=analysis_id, video_id=video_id, params=params, fps=float(fps), width=width, height=height,
-            frames_processed=frames_processed, frames_total=total or frames_processed, tracks=result_tracks,
-        )
-        if result_tracks:
-            self._extract_crops(video_path, analysis, progress)
-            self.encode_tracks(analysis, progress)
-        return analysis
-
-    def _extract_crops(self, video_path: Path, analysis: Analysis, progress: ProgressCb) -> None:
-        """Pass 2: re-reads only the frames needed for each track's 16-frame clip and previews."""
+    def _extract_crops(self, video_path: Path, analysis: Analysis, tids: List[int], progress: ProgressCb) -> None:
+        """Pass 2: re-reads only the frames needed for the given tracks' 16-frame clips and previews."""
         wanted: Dict[int, List[Tuple[int, int]]] = {}  # frame -> [(track_id, slot)]
-        for t in analysis.tracks.values():
-            picks = np.linspace(0, len(t.det_frames) - 1, NUM_TRACK_FRAMES).round().astype(int)
+        for tid in tids:
+            t = analysis.tracks[tid]
             t.clip = np.zeros((NUM_TRACK_FRAMES, CROP_SIZE, CROP_SIZE, 3), dtype=np.uint8)
-            for slot, p in enumerate(picks):
-                wanted.setdefault(t.det_frames[p], []).append((t.id, slot))
+            for slot, f in enumerate(self._pick_clip_frames(t)):
+                wanted.setdefault(f, []).append((tid, slot))
         film_slots = {0, 5, 10, 15}
         thumb_slot = NUM_TRACK_FRAMES // 2
-        film: Dict[int, Dict[int, bytes]] = {tid: {} for tid in analysis.tracks}
+        film: Dict[int, Dict[int, bytes]] = {tid: {} for tid in tids}
 
         cap = cv2.VideoCapture(str(video_path))
-        last_needed = max(wanted)
-        idx = 0
+        first_needed, last_needed = min(wanted), max(wanted)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, first_needed)
+        idx = first_needed
         while idx <= last_needed:
             ok, frame = cap.read()
             if not ok:
@@ -369,31 +865,121 @@ class SearchEngine:
                     film[tid][slot] = _jpeg(crop, 256)
             idx += 1
             if idx % 10 == 0:
-                progress("crops", idx, last_needed + 1)
+                progress("crops", idx - first_needed, last_needed - first_needed + 1)
         cap.release()
-        for tid, t in analysis.tracks.items():
-            t.film = [film[tid][s] for s in sorted(film[tid])]
+        for tid in tids:
+            analysis.tracks[tid].film = [film[tid][s] for s in sorted(film[tid])]
         progress("crops", 1, 1)
 
-    def encode_tracks(self, analysis: Analysis, progress: Optional[ProgressCb] = None) -> None:
-        """Encodes every track clip with SpaceTimeViT. Cached per checkpoint."""
-        order = sorted(analysis.tracks)
-        outs: Dict[str, List[torch.Tensor]] = {"V_app": [], "V_mot": [], "V_video": []}
-        for b in range(0, len(order), ENCODE_BATCH):
-            ids = order[b:b + ENCODE_BATCH]
+    def encode_tracks(self, analysis: Analysis, tids: Optional[List[int]] = None,
+                      progress: Optional[ProgressCb] = None, stage: str = "encode") -> None:
+        """Encodes track clips with SpaceTimeViT (all tracks by default) and rebuilds the search matrices."""
+        if tids is None:
+            tids = sorted(analysis.tracks)
+            analysis.track_emb = {}
+        for b in range(0, len(tids), ENCODE_BATCH):
+            ids = tids[b:b + ENCODE_BATCH]
             clips = torch.from_numpy(np.stack([analysis.tracks[i].clip for i in ids]))  # [B,T,H,W,3]
             x = clips.permute(0, 1, 4, 2, 3).float().div(255.0)                          # [B,T,3,H,W]
             x = ((x.flatten(0, 1) - _MEAN) / _STD).view_as(x).to(self.device)
             with self.model_lock, torch.no_grad():
                 v_app, v_mot, v_video = self.model.encode_video(x)
-            outs["V_app"].append(v_app.float().cpu())
-            outs["V_mot"].append(v_mot.float().cpu())
-            outs["V_video"].append(v_video.float().cpu())
+            for j, tid in enumerate(ids):
+                analysis.track_emb[tid] = {
+                    "V_app": F.normalize(v_app[j].float().cpu(), dim=-1),
+                    "V_mot": F.normalize(v_mot[j].float().cpu(), dim=-1),
+                    "V_video": F.normalize(v_video[j].float().cpu(), dim=-1),
+                }
             if progress:
-                progress("encode", b + len(ids), len(order))
-        analysis.emb = {k: F.normalize(torch.cat(v), dim=-1) for k, v in outs.items()}
-        analysis.track_order = order
+                progress(stage, b + len(ids), len(tids))
+        self._rebuild_matrices(analysis)
         analysis.ckpt_key = self.ckpt_key
+
+    @staticmethod
+    def _rebuild_matrices(analysis: Analysis) -> None:
+        order = sorted(analysis.tracks)
+        analysis.track_order = order
+        analysis.emb = {k: torch.stack([analysis.track_emb[t][k] for t in order]) for k in ("V_app", "V_mot", "V_video")}
+
+    def _stitch(self, video_path: Path, analysis: Analysis, progress: ProgressCb) -> None:
+        """
+        Re-ID across gaps (occlusions): joins tracklet B onto A when B starts at most STITCH_MAX_GAP_S after A
+        ends, near where A was last seen, the attribute model does not see a different gender, and the OpenVINO
+        re-ID embeddings agree (V_app similarity is the fallback when the re-ID model is unavailable). Merged tracks are re-cropped and re-encoded,
+        then ids are renumbered by start time.
+        """
+        fps = analysis.fps
+        tr = analysis.tracks
+        center = lambda b: ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+        cands = []
+        for a in tr.values():
+            a_box = a.boxes[a.det_frames[-1]]
+            for b in tr.values():
+                gap = b.det_frames[0] - a.det_frames[-1]
+                if gap <= 0 or gap > STITCH_MAX_GAP_S * fps:
+                    continue
+                b_box = b.boxes[b.det_frames[0]]
+                h = max(a_box[3] - a_box[1], b_box[3] - b_box[1])
+                (ax, ay), (bx, by) = center(a_box), center(b_box)
+                if math.hypot(ax - bx, ay - by) > h * (STITCH_SPEED * gap / fps + 0.5):
+                    continue
+                if "male" in a.attrs and "male" in b.attrs and abs(a.attrs["male"] - b.attrs["male"]) > STITCH_GENDER_GAP:
+                    continue
+                if a.reid is not None and b.reid is not None:
+                    sim = float(a.reid @ b.reid)
+                    ok = sim >= REID_MIN_SIM
+                else:
+                    sim = float(analysis.track_emb[a.id]["V_app"] @ analysis.track_emb[b.id]["V_app"])
+                    ok = sim >= STITCH_MIN_SIM
+                if ok:
+                    cands.append((sim, a.id, b.id, gap))
+
+        succ: Dict[int, int] = {}
+        pred: Dict[int, int] = {}
+        analysis.stitch_log = []
+        for sim, a, b, gap in sorted(cands, reverse=True):
+            if a in succ or b in pred:
+                continue
+            succ[a], pred[b] = b, a
+            analysis.stitch_log.append({"from": a, "to": b, "sim": round(sim, 4), "gap_s": round(gap / fps, 2)})
+        if not succ:
+            progress("stitch", 1, 1)
+            return
+
+        merged = []
+        head_of: Dict[int, int] = {}
+        for head in [t for t in tr if t not in pred and t in succ]:
+            cur = head
+            head_of[head] = head
+            while cur in succ:
+                head_of[succ[cur]] = head
+                nxt = tr.pop(succ[cur])
+                h = tr[head]
+                h.boxes.update(nxt.boxes)
+                h.quality.update(nxt.quality)
+                h.det_frames = sorted(set(h.det_frames) | set(nxt.det_frames))
+                if h.reid is not None and nxt.reid is not None:
+                    m = h.reid * h.reid_n + nxt.reid * nxt.reid_n
+                    h.reid, h.reid_n = m / max(float(np.linalg.norm(m)), 1e-6), h.reid_n + nxt.reid_n
+                analysis.track_emb.pop(nxt.id, None)
+                cur = nxt.id
+            merged.append(head)
+        progress("stitch", 0, 1)
+        self._extract_crops(video_path, analysis, merged, lambda *a: None)
+        self._attributes(analysis, merged)
+        self._reid(analysis, merged)
+        self.encode_tracks(analysis, tids=merged, progress=progress, stage="stitch")
+
+        # Renumber 1..N by start time so ids read naturally in the UI
+        order = sorted(tr.values(), key=lambda t: t.start)
+        remap = {t.id: i for i, t in enumerate(order, start=1)}
+        analysis.tracks = {remap[t.id]: t for t in order}
+        analysis.track_emb = {remap[k]: v for k, v in analysis.track_emb.items()}
+        for t in order:
+            t.id = remap[t.id]
+        for s in analysis.stitch_log:
+            s["into"] = remap[head_of[s["from"]]]
+        self._rebuild_matrices(analysis)
 
     # ------------------------------------------------------------------ search
     def search(self, analysis: Analysis, prompt: str) -> Dict[str, Any]:
@@ -409,6 +995,7 @@ class SearchEngine:
             "q_mot": concepts["q_mot"],
             "app_keywords": concepts["app_keywords"],
             "mot_keywords": concepts["mot_keywords"],
+            "constraints": query_attributes(prompt) if self.attr_model is not None else [],
             "scores": [],
         }
         if not analysis.tracks:
@@ -420,18 +1007,31 @@ class SearchEngine:
         sim_joint = (analysis.emb["V_video"] @ t[0]).tolist()
         sim_app = (analysis.emb["V_app"] @ t[1]).tolist()
         sim_mot = (analysis.emb["V_mot"] @ t[2]).tolist()
-        result["scores"] = [
-            {"track_id": tid, "joint": round(sim_joint[i], 5), "app": round(sim_app[i], 5), "mot": round(sim_mot[i], 5)}
-            for i, tid in enumerate(analysis.track_order)
-        ]
+        result["scores"] = []
+        for i, tid in enumerate(analysis.track_order):
+            attr_p = {c["key"]: constraint_p(analysis.tracks[tid], c) for c in result["constraints"]}
+            known = [(c["weight"], attr_p[c["key"]]) for c in result["constraints"] if attr_p[c["key"]] is not None]
+            result["scores"].append({
+                "track_id": tid, "joint": round(sim_joint[i], 5), "app": round(sim_app[i], 5),
+                "mot": round(sim_mot[i], 5),
+                "attr_p": {k: (None if v is None else round(v, 4)) for k, v in attr_p.items()},
+                "penalty": round(sum(w * (1.0 - p) for w, p in known), 5),      # subtracted from the fused score
+                "attr_min": round(min(p for _, p in known), 4) if known else None,  # used by the attribute filter
+            })
         return result
 
     @staticmethod
-    def rank(scores: List[Dict[str, Any]], weights: Dict[str, float]) -> List[Dict[str, Any]]:
-        """Fuses the three scores with normalised weights and adds softmax match probability."""
+    def rank(scores: List[Dict[str, Any]], weights: Dict[str, float], attr_filter: bool = False) -> List[Dict[str, Any]]:
+        """
+        Fuses the three scores with normalised weights, subtracts the attribute penalty and adds softmax match
+        probability. attr_filter drops tracks failing any query constraint (p < 0.5).
+        Mirrored by static/js/app.js::rerank, keep the two in sync.
+        """
         wsum = sum(max(0.0, float(weights.get(k, 0.0))) for k in DEFAULT_WEIGHTS) or 1.0
         w = {k: max(0.0, float(weights.get(k, 0.0))) / wsum for k in DEFAULT_WEIGHTS}
-        ranked = [dict(s, fused=sum(w[k] * s[k] for k in w)) for s in scores]
+        if attr_filter:
+            scores = [s for s in scores if s.get("attr_min") is None or s["attr_min"] >= 0.5]
+        ranked = [dict(s, fused=sum(w[k] * s[k] for k in w) - s.get("penalty", 0.0)) for s in scores]
         ranked.sort(key=lambda s: s["fused"], reverse=True)
         if ranked:
             m = max(s["fused"] for s in ranked)
@@ -508,6 +1108,7 @@ class SearchEngine:
                 "start": t.start,
                 "end": t.end,
                 "n_det": len(t.det_frames),
+                "attrs": {k: (v if isinstance(v, dict) else round(v, 3)) for k, v in t.attrs.items()},
                 "boxes": [[f, *t.boxes[f]] for f in frames],
                 "thumb": _data_url(t.thumb) if t.thumb else "",
                 "film": [_data_url(j) for j in t.film],

@@ -148,6 +148,7 @@
             <li data-stage="detect"><i></i><span data-i18n="st_detect">Phát hiện &amp; theo vết</span></li>
             <li data-stage="crops"><i></i><span data-i18n="st_crops">Trích xuất ảnh người</span></li>
             <li data-stage="encode"><i></i><span data-i18n="st_encode">Mã hóa SpaceTimeViT</span></li>
+            <li data-stage="stitch"><i></i><span data-i18n="st_stitch">Nối lại người bị mất dấu (re-ID)</span></li>
           </ol>
           <div class="bar bar-lg"><i id="analyze-bar"></i></div>
           <div class="progress-meta">
@@ -172,7 +173,6 @@
               <svg><use href="#i-arrow"/></svg>
             </button>
           </div>
-          <div class="chips" id="examples"></div>
         </form>
 
         <div class="dsca" id="dsca" hidden>
@@ -182,6 +182,7 @@
           </div>
           <div class="dsca-row app"><span class="dsca-tag">Q<sub>app</sub></span><span class="dsca-text" id="q-app"></span></div>
           <div class="dsca-row mot"><span class="dsca-tag">Q<sub>mot</sub></span><span class="dsca-text" id="q-mot"></span></div>
+          <div class="dsca-row attrs" id="attr-row" hidden><span class="dsca-tag" data-i18n-title="attr_info" title="">Attr</span><span class="dsca-text attr-chips" id="q-attrs"></span></div>
         </div>
       </section>
     </aside>
@@ -308,6 +309,11 @@
             <input type="checkbox" id="show-all">
             <span class="track"></span>
             <span data-i18n="show_all">Hiện cả người ngoài top-K</span>
+          </label>
+          <label class="switch" data-i18n-title="attr_filter_info" title="">
+            <input type="checkbox" id="attr-filter" disabled>
+            <span class="track"></span>
+            <span data-i18n="attr_filter">Chỉ người khớp thuộc tính</span>
           </label>
         </div>
         <div class="cands" id="cands"></div>

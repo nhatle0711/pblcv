@@ -8,7 +8,7 @@ import time
 import zipfile
 from typing import Any, Dict, List
 
-from .engine import Analysis, _data_url, rank_color
+from .engine import ATTR_NAMES, Analysis, _data_url, rank_color
 
 TEXT = {
     "vi": {
@@ -72,6 +72,10 @@ def build_report(analysis: Analysis, search: Dict[str, Any], ranked: List[Dict[s
             "joint": s["joint"],
             "app": s["app"],
             "mot": s["mot"],
+            **{f"{k}_prob": round(t.attrs[k], 3) if k in t.attrs else None for k in ATTR_NAMES},
+            "top_color": max(t.attrs["top_color"], key=t.attrs["top_color"].get) if t.attrs.get("top_color") else None,
+            "bottom_color": max(t.attrs["bottom_color"], key=t.attrs["bottom_color"].get) if t.attrs.get("bottom_color") else None,
+            "attribute_penalty": s.get("penalty", 0.0),
             "start_frame": t.start,
             "end_frame": t.end,
             "start_s": round(t.start / fps, 3),

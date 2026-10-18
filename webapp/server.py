@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import video_io
-from .engine import DEFAULT_WEIGHTS, RANK_COLORS, Analysis, SearchEngine
+from .engine import DEFAULT_WEIGHTS, RANK_COLORS, TRACKER_VERSION, Analysis, SearchEngine
 from .jobs import JobManager
 from .report import build_report
 
@@ -63,6 +63,12 @@ class RankBody(SearchBody):
     weights: Dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     top_k: int = Field(5, ge=1, le=10)
     lang: str = "vi"
+    attr_filter: bool = False
+    gender_filter: bool = False   # legacy name of attr_filter
+
+    @property
+    def filter_attrs(self) -> bool:
+        return self.attr_filter or self.gender_filter
 
 
 class CheckpointBody(BaseModel):
@@ -173,6 +179,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
             "palette": [hex_ for _, hex_ in RANK_COLORS],
             "default_weights": DEFAULT_WEIGHTS,
             "max_upload_mb": max_upload_mb,
+            "attributes": engine.attr_model is not None,
         }
 
     @app.post("/api/checkpoint")
@@ -260,7 +267,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
     @app.post("/api/videos/{vid}/analyze")
     def analyze(vid: str, params: AnalyzeParams):
         v = get_video(vid)
-        key = (vid, params.max_frames, params.stride, round(params.conf, 2))
+        key = (vid, params.max_frames, params.stride, round(params.conf, 2), TRACKER_VERSION)
         if key in analysis_keys and analysis_keys[key] in analyses:
             return {"analysis_id": analysis_keys[key], "cached": True, "job_id": None}
 
@@ -268,7 +275,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
 
         def run(job):
             prepare(v, job.progress)
-            a = engine.analyze(v.proxy, vid, aid, params.model_dump(), job.progress)
+            a = engine.analyze(v.proxy, vid, aid, {**params.model_dump(), "tracker": TRACKER_VERSION}, job.progress)
             with registry_lock:
                 analyses[aid] = a
                 analysis_keys[key] = aid
@@ -276,7 +283,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
             return {"analysis_id": aid}
 
         job = jobs.submit("analyze", {
-            "prepare": (0, 5), "detect": (5, 80), "crops": (80, 86), "encode": (86, 100),
+            "prepare": (0, 3), "detect": (3, 45), "crops": (45, 50), "encode": (50, 92), "stitch": (92, 100),
         }, run)
         return {"analysis_id": None, "cached": False, "job_id": job.id}
 
@@ -315,7 +322,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
         weights = resolve_weights(body.weights)
 
         def run(job):
-            ranked = engine.rank(engine.search(a, body.prompt)["scores"], weights)
+            ranked = engine.rank(engine.search(a, body.prompt)["scores"], weights, body.filter_attrs)
             if not ranked:
                 raise ValueError("No persons to render")
             tag = hashlib.sha1(f"{body.prompt}|{weights}|{body.top_k}|{engine.ckpt_key}".encode()).hexdigest()[:10]
@@ -343,7 +350,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
         a = get_analysis(aid)
         weights = resolve_weights(body.weights)
         res = engine.search(a, body.prompt)
-        ranked = engine.rank(res["scores"], weights)
+        ranked = engine.rank(res["scores"], weights, body.filter_attrs)
         name = videos[a.video_id].name if a.video_id in videos else a.video_id
         data = build_report(a, res, ranked, weights, body.top_k, body.lang, name, engine.ckpt_key)
         fname = f"report_{Path(name).stem}_{time.strftime('%Y%m%d_%H%M%S')}.zip"

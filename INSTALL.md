@@ -25,7 +25,7 @@ curl.exe -L -o checkpoints\best_weights.pth https://github.com/NguyenChien510/pb
 python web_demo.py
 ```
 
-Trình duyệt sẽ tự mở **http://127.0.0.1:8000**. Lần chạy đầu sẽ tải thêm BERT và YOLO nên mất thêm 1–2 phút. Dừng server bằng **Ctrl + C**.
+Trình duyệt sẽ tự mở **http://127.0.0.1:8000**. Lần chạy đầu sẽ tải thêm BERT, YOLO, YOLO-pose, model re-ID và model thuộc tính người (giới tính, balo, màu áo…) nên mất thêm 1–2 phút. Dừng server bằng **Ctrl + C**.
 
 **Các lần sau** chỉ cần mở PowerShell và chạy:
 
@@ -40,3 +40,7 @@ python web_demo.py
 - **Có GPU NVIDIA:** ở bước 3, thay `whl/cpu` bằng `whl/cu126`.
 - **Cổng 8000 đang bị chiếm:** chạy `python web_demo.py --port 8080`.
 - **Lỗi `No usable checkpoint` / `Architecture mismatch`:** file checkpoint chưa tải đủ 659 MB. Xóa file rồi tải lại ở bước 4.
+
+
+
+.venv/bin/python web_demo.py --port 8000

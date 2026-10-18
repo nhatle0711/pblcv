@@ -28,6 +28,11 @@ python train.py --data_root /path/to/dataset --no_pretrained_vit
 python test.py --sub_dataset TVPReid-PRID --checkpoint checkpoints/TVPReid-PRID/best.pth --confusion_matrix --cm_size 10
 python test.py --sub_dataset TVPReid-PRID --dashboard          # regenerate training dashboard from ckpt history
 
+# Training-free inference tricks (utils/rerank.py): fusion weights, flip-TTA, hubness reduction with a caption bank.
+# Without these flags test.py reproduces the original numbers exactly.
+python test.py --sub_dataset TVPReid-PRID --weights 0.5 0.35 0.15 --tta_flip --hub train --hub_beta 0.5
+python test.py --sub_dataset TVPReid-PRID --sweep              # one encode, full grid -> reports/<sub>/inference_sweep.json
+
 # Single text query against the val gallery
 python test.py --sub_dataset TVPReid-PRID --query "A man in a dark grey jacket walking away"
 
@@ -60,11 +65,31 @@ Data flow: `data/dataset.py` → `models/damr_main.py::DAMRModel` → `loss/crit
 
 - **Prepare** (`webapp/video_io.py`): every input video is re-encoded to a constant-frame-rate H.264 `proxy.mp4` (max 720p) using the ffmpeg bundled with `imageio-ffmpeg`. *All* analysis and rendering read the proxy, so frame index `i` equals player time `i / fps` in the browser overlay. Do not analyse the original file.
 - **Analyse** (`webapp/engine.py::SearchEngine.analyze`):
-  - Pass 1 runs YOLO detection with greedy IoU/centre tracking and keeps boxes only.
-  - Pass 2 re-reads just the 16 frames each track needs.
-  - Each clip is then batch-encoded into `V_app/V_mot/V_video`.
-  - The result is cached in memory as an `Analysis`, keyed by `(video_id, max_frames, stride, conf)`. Only the first `max_frames` frames are processed.
+  - Pass 1 runs `YOLO.track` with ultralytics **BoT-SORT**: Kalman filter, two-stage high/low-score Hungarian matching, and native ReID features (`with_reid`, `model: auto`). The tracker yaml is written to a temp file for each run. The UI `conf` is used as `track_high_thresh`; the detector runs at `DETECT_CONF_LOW`. `imgsz` is 960 in Accurate mode and 640 in Balanced/Fast mode. This pass keeps only boxes plus a per-detection quality score (conf × (1 − occlusion) × size). The greedy tracker `_track_greedy` is only a fallback for non-YOLO detectors.
+  - Tracks with fewer than `MIN_TRACK_DETECTIONS` detections or a median height under `MIN_TRACK_HEIGHT` are dropped.
+  - Pass 2 re-reads only the frames each 16-frame clip needs. In each of the 16 time bins it picks the best-quality (least occluded) detection.
+  - Each clip is batch-encoded into `V_app/V_mot/V_video`. On CPU this costs about 2s per track, which dominates analysis time in crowded scenes.
+  - **Re-ID (split + stitch).** OpenVINO `person-reidentification-retail-0277` (about 8MB, `checkpoints/reid/`) is a real person re-ID model. Do **not** use `V_app` for re-ID: it is a text-retrieval embedding, and different people reach about 0.92 there. It is only the fallback when the re-ID model is missing.
+    - During tracking, a re-ID sample is taken per track every `REID_SAMPLE_S` (0.25s), only from boxes with overlap ≤ `REID_SAMPLE_MAX_OCCL`.
+    - `_split_by_appearance` cuts a track where the mean embeddings before and after differ (cosine < `SPLIT_MAX_SIM` 0.40). This fixes BoT-SORT jumping to the person who occludes the tracked one.
+    - `_stitch` joins tracklet B onto A when all of these hold:
+      - B starts at most `STITCH_MAX_GAP_S` (8s) after A ends;
+      - B starts near A's last position;
+      - the genders are not clearly different;
+      - the cosine of the sample-mean embeddings `Track.reid` is ≥ `REID_MIN_SIM` 0.60.
+    - Calibration on a crowded station clip: different people reach a p99 of about 0.40, the same person a median of about 0.79, and 0.52–0.56 produced visible wrong joins.
+    - On that clip, mixed-identity tracks fell from 37% to 21% and 27 tracks span more than 10s. Merged tracks are re-cropped and re-encoded, and ids are renumbered by start time.
+  - The result is cached in memory as an `Analysis`, keyed by `(video_id, max_frames, stride, conf, TRACKER_VERSION)`. Only the first `max_frames` frames are processed. Bump `TRACKER_VERSION` when tracking logic changes.
 - **Search** returns three raw cosines per track: `T_full↔V_video`, `T_app↔V_app` and `T_mot↔V_mot`. `T_app`/`T_mot` come from `TextDecomposer.extract_concepts`. Fusion weights (default 0.50/0.35/0.15, the same as `train.py::evaluate`) and the softmax(τ=0.07) "match probability" are computed **in the browser** (`static/js/app.js::rerank`). The same logic is mirrored in `SearchEngine.rank`, which renders and reports use, so keep the two in sync.
+- **Attribute matching**: the DSCA scores alone are weak on gender (roughly chance), colours and carried items, so query constraints are checked against dedicated models.
+  - **Models.** OpenVINO `person-attributes-recognition-crossroad-0230` (about 3MB) is auto-downloaded to `checkpoints/attributes/`. It gives 8 probabilities (male, bag, backpack, hat, longsleeves, longpants, longhair, coat). `yolov8n-pose.pt` lives in `checkpoints/`.
+  - **Per track** (`SearchEngine._attributes`, run over the 5 preview crops):
+    - The attribute probabilities are averaged into `Track.attrs`.
+    - Pose keypoints locate the top garment (shoulders → hips) and the bottom garment (hips → knees). `_garment_regions` returns no bottom region when the hips are not visible.
+    - `_color_hist` assigns each region's pixels to the nearest of the `COLOR_PROTOS` in L-down-weighted Lab space, giving `attrs["top_color"]` and `attrs["bottom_color"]` (colour → fraction).
+  - **Query side.** `query_attributes(prompt)` parses gender words, colour+garment pairs (`TOP_GARMENTS`/`BOTTOM_GARMENTS`) and `ATTR_PATTERNS` into constraints `{key, value, weight}` (`CONSTRAINT_WEIGHTS`). There is no negation handling; it was removed on purpose.
+  - **Scoring.** `search` adds per track `attr_p` (from `constraint_p`), `penalty = Σ weight·(1 − p)` and `attr_min`. Fused = weighted cosines − penalty. The "matching attributes only" filter drops tracks with `attr_min < 0.5`. `SearchEngine.rank` and `app.js::rerank` both implement this, so keep them in sync.
+  - **Fallbacks.** If openvino or the attribute model is missing, constraints are empty and ranking is pure DSCA. If the pose model is missing, colours fall back to the attribute model's colour points.
 - **Jobs** (`webapp/jobs.py`): prepare, analyse and render run on a single worker thread, and the UI polls `/api/jobs/{id}`. HTTP handlers are plain `def`, so they run in FastAPI's threadpool and never block the event loop. Checkpoint switching is refused while a job is busy. Embeddings are re-encoded lazily when the active checkpoint changes.
 - **Storage**: files live in `uploads/videos/<id>/`, which is wiped at every server start because the index is in memory. Videos are addressed only by id; there is no path-based file access.
 - **Startup**: `SearchEngine` passes `pretrained_vit=False` when a checkpoint exists, because the ImageNet ViT weights would be overwritten anyway; this skips a 331MB download. If `bert-base-uncased` cannot be loaded, `TextEncoder` silently falls back to an untrained encoder, so checkpoints fail the full-match check in `SearchEngine.load_checkpoint`. The engine prints a warning when that happens.

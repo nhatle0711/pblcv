@@ -15,3 +15,6 @@ uvicorn
 python-multipart
 imageio-ffmpeg        # bundled ffmpeg for H.264 proxies/renders
 ultralytics
+lap                   # BoT-SORT association (ultralytics would pip-install it at runtime otherwise)
+scipy
+openvino              # pedestrian attributes (gender) model, downloaded to checkpoints/attributes on first run

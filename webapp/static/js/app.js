@@ -1,4 +1,4 @@
-import { t, getLang, setLang, onLangChange, applyI18n, EXAMPLE_CHIPS } from "./i18n.js";
+import { t, getLang, setLang, onLangChange, applyI18n } from "./i18n.js";
 import { get, post, postBlob, upload, pollJob, downloadBlob } from "./api.js";
 import { Player } from "./player.js";
 
@@ -7,7 +7,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const SOFTMAX_TAU = 0.07;
 const NEUTRAL = "#94a3b8";
 const DARK_TEXT_RANKS = new Set([1, 2, 3, 7, 8, 9]);
-const STAGE_ORDER = ["prepare", "detect", "crops", "encode"];
+const STAGE_ORDER = ["prepare", "detect", "crops", "encode", "stitch"];
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("ps." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -25,6 +25,7 @@ const S = {
   weights: store.get("weights", null),
   topK: store.get("topK", 5),
   showAll: store.get("showAll", false),
+  attrFilter: store.get("attrFilter", store.get("genderFilter", false)),
   stride: store.get("stride", 1),
   selected: null,
   hidden: new Set(),
@@ -75,7 +76,13 @@ function normWeights() {
 function rerank() {
   if (!S.search?.scores?.length) { S.ranked = []; refresh(); return; }
   const w = normWeights();
-  const ranked = S.search.scores.map((s) => ({ ...s, fused: w.joint * s.joint + w.app * s.app + w.mot * s.mot }));
+  let scores = S.search.scores;
+  if (S.attrFilter && S.search.constraints?.length) scores = scores.filter((s) => s.attr_min == null || s.attr_min >= 0.5);
+  if (!scores.length) { S.ranked = []; refresh(); return; }
+  const ranked = scores.map((s) => ({
+    ...s,
+    fused: w.joint * s.joint + w.app * s.app + w.mot * s.mot - (s.penalty ?? 0),
+  }));
   ranked.sort((a, b) => b.fused - a.fused);
   const m = ranked[0].fused;
   const exps = ranked.map((s) => Math.exp((s.fused - m) / SOFTMAX_TAU));
@@ -334,25 +341,11 @@ async function loadAnalysis(aid, fresh) {
 }
 
 // ======================================================================== step 3: search
-function renderExamples() {
-  $("examples").innerHTML = Object.entries(EXAMPLE_CHIPS)
-    .map(([k, label]) => `<button type="button" data-ex="${k}" title="${esc(t(k))}">${esc(label)}</button>`).join("");
-}
-
 function autoGrow() {
   const el = $("prompt");
   el.style.height = "auto";
   el.style.height = `${Math.min(el.scrollHeight + 2, 140)}px`;
 }
-$("examples").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-ex]");
-  if (!b) return;
-  $("prompt").value = t(b.dataset.ex);
-  store.set("prompt", $("prompt").value);
-  autoGrow();
-  $("prompt").focus();
-  if (S.analysis?.tracks.length) runSearch();
-});
 $("prompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("search-form").requestSubmit(); }
 });
@@ -388,6 +381,49 @@ function renderDsca() {
   if (!s) return;
   $("q-app").innerHTML = markKeywords(s.q_app, s.app_keywords);
   $("q-mot").innerHTML = markKeywords(s.q_mot, s.mot_keywords);
+  const cs = s.constraints || [];
+  $("attr-row").hidden = !cs.length;
+  $("q-attrs").innerHTML = cs.map((c) => `<span class="achip">${constraintLabel(c)}</span>`).join("");
+  $("attr-filter").disabled = !cs.length;
+}
+
+const COLOR_CSS = { black: "#111827", white: "#f8fafc", grey: "#8b8f97", red: "#dc2626", orange: "#f97316",
+  yellow: "#facc15", green: "#16a34a", blue: "#2563eb", purple: "#7e22ce", pink: "#f472b6", brown: "#7c4a1e", beige: "#d6c3a0" };
+const swatch = (c) => `<span class="swatch" style="background:${COLOR_CSS[c] || "transparent"}"></span>`;
+const dominant = (d) => (d ? Object.entries(d).sort((a, b) => b[1] - a[1])[0][0] : null);
+
+/** Short human label of one query constraint, e.g. "♀ Nữ", "Áo ■ đỏ", "Balo". */
+function constraintLabel(c) {
+  if (c.key === "gender") return `${c.value === "male" ? "♂" : "♀"} ${esc(t(`attr_${c.value}`))}`;
+  if (c.key === "top_color" || c.key === "bottom_color") {
+    const part = t(c.key === "top_color" ? "attr_top" : "attr_bottom");
+    return `${esc(part)} ${c.value.map((v) => `${swatch(v)} ${esc(t(`color_${v}`))}`).join(" / ")}`;
+  }
+  return esc(t(`attr_${c.key}${c.value ? "" : "_no"}`));
+}
+
+/** Gender badge, detected garment colours and, after a search, one chip per query constraint with its match %. */
+function attrBadges(tr, s) {
+  const a = tr?.attrs || {};
+  const cs = s ? S.search?.constraints || [] : [];
+  let html = "";
+  if (a.male != null) {
+    const male = a.male >= 0.5;
+    const p = s?.attr_p?.gender;
+    html += `<span class="gender ${male ? "m" : "f"}${p != null && p < 0.5 ? " mismatch" : ""}" title="${esc(t("gender_info"))}">${male ? "♂" : "♀"} ${Math.round((male ? a.male : 1 - a.male) * 100)}%</span>`;
+  }
+  const top = dominant(a.top_color), bottom = dominant(a.bottom_color);
+  if (top || bottom) {
+    const name = (c) => (c ? t(`color_${c}`) : t("attr_unknown"));
+    html += `<span class="swatches" title="${esc(t("attr_colors", { top: name(top), bottom: name(bottom) }))}">${top ? swatch(top) : ""}${bottom ? swatch(bottom) : ""}</span>`;
+  }
+  for (const c of cs) {
+    if (c.key === "gender") continue;
+    const p = s.attr_p?.[c.key];
+    const cls = p == null ? " unknown" : p < 0.5 ? " mismatch" : "";
+    html += `<span class="achip${cls}">${constraintLabel(c)} <b>${p == null ? "?" : `${Math.round(p * 100)}%`}</b></span>`;
+  }
+  return html;
 }
 
 /** Highlights each extracted keyword inside its sub-prompt (whole words, case-insensitive). */
@@ -409,6 +445,7 @@ function renderWeights() {
   $("wtext").textContent = ["joint", "app", "mot"].map((k) => Math.round(n[k] * 100)).join("/");
   setPressed($("topk-seg"), "data-k", S.topK);
   $("show-all").checked = S.showAll;
+  $("attr-filter").checked = S.attrFilter;
 }
 
 // ---- weights popover
@@ -439,6 +476,7 @@ $("topk-seg").addEventListener("click", (e) => {
   refresh();
 });
 $("show-all").addEventListener("change", (e) => { S.showAll = e.target.checked; store.set("showAll", S.showAll); refresh(); });
+$("attr-filter").addEventListener("change", (e) => { S.attrFilter = e.target.checked; store.set("attrFilter", S.attrFilter); rerank(); });
 $("weights-reset").addEventListener("click", () => {
   S.weights = { ...S.defaults };
   store.set("weights", S.weights);
@@ -484,7 +522,7 @@ function viewItems() {
       hidden: S.hidden.has(s.track_id) || (!inTop && !S.showAll),
       keepLane: inTop,
       thumb: tr?.thumb,
-      tip: `${t("score")} ${s.fused.toFixed(3)} · ${pct(s.prob)}`,
+      tip: `${t("score")} ${s.fused.toFixed(3)} · ${pct(s.prob)}${tr?.attrs?.male != null ? ` · ${tr.attrs.male >= 0.5 ? "♂" : "♀"}` : ""}`,
     };
   });
 }
@@ -566,6 +604,7 @@ function renderResults() {
         </div>
         <div class="cand-meta">
           ${s ? `<span>${esc(t("score"))} <span class="mono">${s.fused.toFixed(4)}</span></span>` : ""}
+          ${attrBadges(tr, s)}
           <span>${esc(t("appears"))} <span class="mono">${time}</span></span>
         </div>
         ${s ? `<div class="scorebars">${bar("joint", s.joint)}${bar("app", s.app)}${bar("mot", s.mot)}</div>` : ""}
@@ -604,7 +643,8 @@ $("cands").addEventListener("click", (e) => {
 
 // ======================================================================== outputs
 function rankBody() {
-  return { prompt: S.search.prompt, weights: normWeights(), top_k: S.topK, lang: getLang() };
+  return { prompt: S.search.prompt, weights: normWeights(), top_k: S.topK, lang: getLang(),
+           attr_filter: S.attrFilter && !!S.search.constraints?.length };
 }
 
 $("render-btn").addEventListener("click", async () => {
@@ -702,7 +742,6 @@ $("theme-btn").addEventListener("click", () => {
 });
 document.querySelectorAll("[data-lang]").forEach((b) => b.addEventListener("click", () => setLang(b.dataset.lang)));
 onLangChange(() => {
-  renderExamples();
   renderVideoMeta();
   updateFramesNote();
   updateSteps();
@@ -726,7 +765,6 @@ document.addEventListener("keydown", (e) => {
 // ======================================================================== boot
 (async function init() {
   applyI18n();
-  renderExamples();
   setPressed($("stride-seg"), "data-stride", S.stride);
   $("prompt").value = store.get("prompt", "");
   autoGrow();
