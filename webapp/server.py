@@ -163,7 +163,8 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
         }
 
     def resolve_weights(w: Dict[str, float]) -> Dict[str, float]:
-        return {k: float(w.get(k, DEFAULT_WEIGHTS[k])) for k in DEFAULT_WEIGHTS}
+        d = engine.default_weights
+        return {k: float(w.get(k, d[k])) for k in d}
 
     # ------------------------------------------------------------------ status / checkpoints
     @app.get("/api/status")
@@ -177,9 +178,10 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
             "ffmpeg": video_io.FFMPEG_EXE is not None,
             "busy": jobs.busy(),
             "palette": [hex_ for _, hex_ in RANK_COLORS],
-            "default_weights": DEFAULT_WEIGHTS,
+            "default_weights": engine.default_weights,
             "max_upload_mb": max_upload_mb,
             "attributes": engine.attr_model is not None,
+            "clip": engine.clip_model is not None,
         }
 
     @app.post("/api/checkpoint")
@@ -283,7 +285,7 @@ def create_app(engine: SearchEngine, uploads_dir: Path, samples_dir: Path, max_u
             return {"analysis_id": aid}
 
         job = jobs.submit("analyze", {
-            "prepare": (0, 3), "detect": (3, 45), "crops": (45, 50), "encode": (50, 92), "stitch": (92, 100),
+            "prepare": (0, 3), "detect": (3, 45), "crops": (45, 50), "clip": (50, 56), "encode": (56, 92), "stitch": (92, 100),
         }, run)
         return {"analysis_id": None, "cached": False, "job_id": job.id}
 

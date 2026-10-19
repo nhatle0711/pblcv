@@ -28,14 +28,19 @@ from models.damr_main import DAMRModel
 
 ProgressCb = Callable[[str, float, float], None]
 
-DEFAULT_WEIGHTS = {"joint": 0.50, "app": 0.35, "mot": 0.15}
+DEFAULT_WEIGHTS = {"joint": 0.30, "app": 0.20, "mot": 0.05, "clip": 0.45}
+DSCA_WEIGHTS = {"joint": 0.50, "app": 0.35, "mot": 0.15}   # defaults when CLIP is unavailable (= train.py::evaluate)
+CLIP_MODEL = "openai/clip-vit-base-patch16"
+CLIP_CROPS = 3              # preview crops per track (thumb + first/last film crop); ~165 ms each on CPU
+CLIP_BATCH = 16
+CLIP_PREFIX = "a photo of "
 NUM_TRACK_FRAMES = 16
 CROP_SIZE = 224
 ENCODE_BATCH = 4
 SOFTMAX_TAU = 0.07          # same temperature as the InfoNCE training loss
 
 # --- tracking (YOLO + BoT-SORT with native ReID) ---
-TRACKER_VERSION = "botsort-reid-v5-split"   # part of the analysis cache key; bump when analysis output changes
+TRACKER_VERSION = "botsort-reid-v5-split-clip"   # part of the analysis cache key; bump when analysis output changes
 DETECT_IMGSZ = 960          # upscaled inference finds small, distant people in crowds (Accurate mode)
 DETECT_IMGSZ_FAST = 640     # Balanced/Fast modes: skips tiny far-away people -> fewer tracks to encode
 DETECT_CONF_LOW = 0.1       # low-score boxes feed BoT-SORT's second association stage
@@ -314,6 +319,7 @@ class Track:
     attrs: Dict[str, Any] = field(default_factory=dict)      # male/backpack/... -> prob; top_color/bottom_color -> {colour: frac}
     reid: Optional[np.ndarray] = None    # L2-normalised mean re-ID embedding (tracking samples or preview crops)
     reid_n: int = 0                      # number of samples behind `reid` (weights merges)
+    clip_emb: Optional[torch.Tensor] = None  # L2-normalised mean CLIP image embedding of preview crops
     clip: Optional[np.ndarray] = None    # [16, 224, 224, 3] RGB uint8, model input
     thumb: bytes = b""                   # JPEG, representative crop
     film: List[bytes] = field(default_factory=list)  # 4 JPEG crops across the track
@@ -346,7 +352,7 @@ class Analysis:
 
 
 class SearchEngine:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, use_clip: bool = True):
         self.root = root
         self.checkpoints_dir = root / "checkpoints"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -373,6 +379,7 @@ class SearchEngine:
         self._load_default_checkpoint()
         self._init_detector()
         self._init_attr_model()
+        self._init_clip(use_clip)
 
     # ------------------------------------------------------------------ checkpoints
     def scan_checkpoints(self) -> List[Dict[str, Any]]:
@@ -567,6 +574,60 @@ class SearchEngine:
             m = self._embed_reid(crops).mean(axis=0)
             t.reid, t.reid_n = m / max(float(np.linalg.norm(m)), 1e-6), len(crops)
 
+    def _init_clip(self, enabled: bool) -> None:
+        """Optional open-vocabulary scorer (fourth fused score). Downloaded once to the HF cache (~600 MB)."""
+        self.clip_model = self.clip_processor = None
+        if not enabled:
+            print("[*] CLIP disabled (--no_clip).")
+            return
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+            self.clip_model = CLIPModel.from_pretrained(CLIP_MODEL).to(self.device).eval()
+            self.clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+            print(f"[+] CLIP: {CLIP_MODEL}")
+        except Exception as e:
+            print(f"[!] CLIP unavailable ({e}): ranking uses the DSCA scores only.")
+            self.clip_model = None
+
+    @property
+    def default_weights(self) -> Dict[str, float]:
+        return dict(DEFAULT_WEIGHTS) if self.clip_model is not None else dict(DSCA_WEIGHTS)
+
+    @staticmethod
+    def _letterbox(img_bgr: np.ndarray) -> np.ndarray:
+        """Pads a (tall) person crop to a square RGB image so CLIP's centre crop keeps head and feet."""
+        h, w = img_bgr.shape[:2]
+        side = max(h, w)
+        out = np.full((side, side, 3), 127, np.uint8)
+        y, x = (side - h) // 2, (side - w) // 2
+        out[y:y + h, x:x + w] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        return out
+
+    def _clip_embed(self, analysis: Analysis, tids: List[int], progress: Optional[ProgressCb] = None) -> None:
+        """Mean CLIP image embedding over up to CLIP_CROPS preview crops of each track."""
+        if self.clip_model is None or not tids:
+            return
+        items = []  # (tid, letterboxed RGB crop)
+        for tid in tids:
+            t = analysis.tracks[tid]
+            jpegs = ([t.thumb] if t.thumb else []) + ([t.film[0], t.film[-1]] if len(t.film) >= 2 else t.film)
+            for j in jpegs[:CLIP_CROPS]:
+                img = cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    items.append((tid, self._letterbox(img)))
+        feats: Dict[int, List[torch.Tensor]] = {}
+        for b in range(0, len(items), CLIP_BATCH):
+            chunk = items[b:b + CLIP_BATCH]
+            x = self.clip_processor(images=[im for _, im in chunk], return_tensors="pt")["pixel_values"].to(self.device)
+            with self.model_lock, torch.inference_mode():
+                f = F.normalize(self.clip_model.get_image_features(pixel_values=x).float().cpu(), dim=-1)
+            for (tid, _), v in zip(chunk, f):
+                feats.setdefault(tid, []).append(v)
+            if progress:
+                progress("clip", b + len(chunk), len(items))
+        for tid, vs in feats.items():
+            analysis.tracks[tid].clip_emb = F.normalize(torch.stack(vs).mean(0), dim=-1)
+
     def _pose_keypoints(self, crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
         """COCO keypoints [17, 3] (crop coordinates) of the person filling each crop, or None."""
         if getattr(self, "pose_model", None) is None or not crops:
@@ -676,6 +737,7 @@ class SearchEngine:
             self._extract_crops(video_path, analysis, list(tracks), progress)
             self._attributes(analysis, list(tracks))
             self._reid(analysis, list(tracks))
+            self._clip_embed(analysis, list(tracks), progress)
             self.encode_tracks(analysis, progress=progress)
             self._stitch(video_path, analysis, progress)
         return analysis
@@ -900,6 +962,8 @@ class SearchEngine:
         order = sorted(analysis.tracks)
         analysis.track_order = order
         analysis.emb = {k: torch.stack([analysis.track_emb[t][k] for t in order]) for k in ("V_app", "V_mot", "V_video")}
+        if order and all(analysis.tracks[t].clip_emb is not None for t in order):
+            analysis.emb["CLIP"] = torch.stack([analysis.tracks[t].clip_emb for t in order])
 
     def _stitch(self, video_path: Path, analysis: Analysis, progress: ProgressCb) -> None:
         """
@@ -968,6 +1032,7 @@ class SearchEngine:
         self._extract_crops(video_path, analysis, merged, lambda *a: None)
         self._attributes(analysis, merged)
         self._reid(analysis, merged)
+        self._clip_embed(analysis, merged)
         self.encode_tracks(analysis, tids=merged, progress=progress, stage="stitch")
 
         # Renumber 1..N by start time so ids read naturally in the UI
@@ -1007,6 +1072,19 @@ class SearchEngine:
         sim_joint = (analysis.emb["V_video"] @ t[0]).tolist()
         sim_app = (analysis.emb["V_app"] @ t[1]).tolist()
         sim_mot = (analysis.emb["V_mot"] @ t[2]).tolist()
+        clip_raw = clip_norm = None
+        if self.clip_model is not None and "CLIP" in analysis.emb:
+            tok = self.clip_processor(text=[CLIP_PREFIX + prompt], return_tensors="pt", padding=True,
+                                      truncation=True, max_length=77)
+            with self.model_lock, torch.inference_mode():
+                ct = F.normalize(self.clip_model.get_text_features(**{k: v.to(self.device) for k, v in tok.items()})
+                                 .float().cpu(), dim=-1)[0]
+            raw = analysis.emb["CLIP"] @ ct
+            # CLIP cosines live in a narrow band (~0.2-0.35); map them per query onto the joint score's
+            # mean/std so the weight slider is meaningful and the softmax temperature still applies.
+            j = torch.tensor(sim_joint)
+            z = (raw - raw.mean()) / raw.std().clamp_min(1e-6) if len(raw) > 1 else raw * 0
+            clip_raw, clip_norm = raw.tolist(), (j.mean() + j.std().nan_to_num(0.0) * z).tolist()
         result["scores"] = []
         for i, tid in enumerate(analysis.track_order):
             attr_p = {c["key"]: constraint_p(analysis.tracks[tid], c) for c in result["constraints"]}
@@ -1014,6 +1092,7 @@ class SearchEngine:
             result["scores"].append({
                 "track_id": tid, "joint": round(sim_joint[i], 5), "app": round(sim_app[i], 5),
                 "mot": round(sim_mot[i], 5),
+                **({"clip": round(clip_norm[i], 5), "clip_raw": round(clip_raw[i], 5)} if clip_norm else {}),
                 "attr_p": {k: (None if v is None else round(v, 4)) for k, v in attr_p.items()},
                 "penalty": round(sum(w * (1.0 - p) for w, p in known), 5),      # subtracted from the fused score
                 "attr_min": round(min(p for _, p in known), 4) if known else None,  # used by the attribute filter
@@ -1023,12 +1102,13 @@ class SearchEngine:
     @staticmethod
     def rank(scores: List[Dict[str, Any]], weights: Dict[str, float], attr_filter: bool = False) -> List[Dict[str, Any]]:
         """
-        Fuses the three scores with normalised weights, subtracts the attribute penalty and adds softmax match
+        Fuses the DSCA (+ CLIP) scores with normalised weights, subtracts the attribute penalty and adds softmax match
         probability. attr_filter drops tracks failing any query constraint (p < 0.5).
         Mirrored by static/js/app.js::rerank, keep the two in sync.
         """
-        wsum = sum(max(0.0, float(weights.get(k, 0.0))) for k in DEFAULT_WEIGHTS) or 1.0
-        w = {k: max(0.0, float(weights.get(k, 0.0))) / wsum for k in DEFAULT_WEIGHTS}
+        keys = [k for k in DEFAULT_WEIGHTS if not scores or k in scores[0]]  # "clip" is absent without CLIP
+        wsum = sum(max(0.0, float(weights.get(k, 0.0))) for k in keys) or 1.0
+        w = {k: max(0.0, float(weights.get(k, 0.0))) / wsum for k in keys}
         if attr_filter:
             scores = [s for s in scores if s.get("attr_min") is None or s["attr_min"] >= 0.5]
         ranked = [dict(s, fused=sum(w[k] * s[k] for k in w) - s.get("penalty", 0.0)) for s in scores]

@@ -153,6 +153,21 @@ export class Player {
 
     // Draw lowest rank first so #1 ends up on top
     const visible = this.items.filter((it) => !it.hidden);
+
+    // Following a person: darken everything except their box, others become faint outlines
+    const selBox = this.selected != null ? this.boxMaps.get(this.selected)?.get(f) : null;
+    const following = !!selBox && !this.items.find((it) => it.id === this.selected)?.hidden;
+    if (following) {
+      const x = ox + selBox[1] * s, y = oy + selBox[2] * s, w = (selBox[3] - selBox[1]) * s, h = (selBox[4] - selBox[2]) * s;
+      const pad = 6;
+      ctx.save();
+      ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+      ctx.beginPath();
+      ctx.rect(0, 0, this.canvas.width, this.canvas.height);
+      ctx.rect(x - pad, y - pad, w + 2 * pad, h + 2 * pad);
+      ctx.fill("evenodd");
+      ctx.restore();
+    }
     for (let i = visible.length - 1; i >= 0; i--) {
       const it = visible[i];
       const b = this.boxMaps.get(it.id)?.get(f);
@@ -162,11 +177,12 @@ export class Player {
       const isSel = this.selected === it.id;
       const isHover = this.hoverId === it.id;
       const faded = this.selected != null && !isSel;
+      const ghost = following && !isSel;   // not the followed person: faint outline, no label
 
       ctx.save();
-      ctx.globalAlpha = it.dim ? 0.55 : faded ? 0.6 : 1;
+      ctx.globalAlpha = ghost ? 0.25 : it.dim ? 0.55 : faded ? 0.6 : 1;
       if (isSel) { ctx.shadowColor = it.color; ctx.shadowBlur = 14; }
-      ctx.lineWidth = isSel ? 3.5 : isHover ? 3 : it.dim ? 1.5 : 2.2;
+      ctx.lineWidth = isSel ? 3.5 : ghost ? 1.2 : isHover ? 3 : it.dim ? 1.5 : 2.2;
       ctx.strokeStyle = it.color;
       if (it.dim) ctx.setLineDash([5, 4]);
       ctx.beginPath();
@@ -174,6 +190,7 @@ export class Player {
       ctx.stroke();
       ctx.restore();
 
+      if (ghost && !isHover) continue;
       // label pill
       ctx.save();
       ctx.globalAlpha = it.dim ? 0.7 : faded ? 0.75 : 1;

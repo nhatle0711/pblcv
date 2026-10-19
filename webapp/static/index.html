@@ -137,7 +137,7 @@
           </label>
           <p class="note" id="frames-note" hidden></p>
 
-          <button type="button" class="btn btn-primary btn-block btn-md" id="analyze-btn" disabled>
+          <button type="button" class="btn btn-primary btn-block btn-md" id="analyze-btn">
             <svg><use href="#i-spark"/></svg><span data-i18n="analyze">Phân tích video</span>
           </button>
         </div>
@@ -147,6 +147,7 @@
             <li data-stage="prepare"><i></i><span data-i18n="st_prepare">Chuẩn bị video</span></li>
             <li data-stage="detect"><i></i><span data-i18n="st_detect">Phát hiện &amp; theo vết</span></li>
             <li data-stage="crops"><i></i><span data-i18n="st_crops">Trích xuất ảnh người</span></li>
+            <li data-stage="clip" id="stage-clip" hidden><i></i><span data-i18n="st_clip">Mã hóa CLIP</span></li>
             <li data-stage="encode"><i></i><span data-i18n="st_encode">Mã hóa SpaceTimeViT</span></li>
             <li data-stage="stitch"><i></i><span data-i18n="st_stitch">Nối lại người bị mất dấu (re-ID)</span></li>
           </ol>
@@ -169,7 +170,7 @@
         <form id="search-form" class="search-form" autocomplete="off">
           <div class="prompt-box">
             <textarea id="prompt" rows="2" maxlength="500" data-i18n-placeholder="prompt_ph" placeholder=""></textarea>
-            <button type="submit" class="search-fab" id="search-btn" disabled data-i18n-title="search_title" title="">
+            <button type="submit" class="search-fab" id="search-btn" data-i18n-title="search_title" title="">
               <svg><use href="#i-arrow"/></svg>
             </button>
           </div>
@@ -263,7 +264,7 @@
             <button type="button" class="btn btn-ghost btn-sm" id="weights-btn" aria-expanded="false" aria-controls="weights-pop">
               <svg><use href="#i-sliders"/></svg>
               <span data-i18n="weights">Trọng số</span>
-              <span class="wbar" aria-hidden="true"><i data-wb="joint"></i><i data-wb="app"></i><i data-wb="mot"></i></span>
+              <span class="wbar" aria-hidden="true"><i data-wb="joint"></i><i data-wb="app"></i><i data-wb="mot"></i><i data-wb="clip"></i></span>
               <span class="mono wtext" id="wtext"></span>
               <svg class="chev"><use href="#i-chevron"/></svg>
             </button>
@@ -290,9 +291,14 @@
                   <input type="range" min="0" max="1" step="0.05" data-w="mot">
                   <output data-wv="mot"></output>
                 </label>
+                <label class="weight" style="--w: var(--c-clip)" id="w-clip-row" hidden>
+                  <span><b>clip</b> <small data-i18n="w_clip">CLIP ViT-B/16</small></span>
+                  <input type="range" min="0" max="1" step="0.05" data-w="clip">
+                  <output data-wv="clip"></output>
+                </label>
               </div>
               <button type="button" class="btn btn-ghost btn-sm" id="weights-reset">
-                <svg><use href="#i-reset"/></svg><span data-i18n="reset_w">Mặc định (0.50 / 0.35 / 0.15)</span>
+                <svg><use href="#i-reset"/></svg><span data-i18n="reset_w">Mặc định</span>
               </button>
             </div>
           </div>
@@ -311,7 +317,7 @@
             <span data-i18n="show_all">Hiện cả người ngoài top-K</span>
           </label>
           <label class="switch" data-i18n-title="attr_filter_info" title="">
-            <input type="checkbox" id="attr-filter" disabled>
+            <input type="checkbox" id="attr-filter">
             <span class="track"></span>
             <span data-i18n="attr_filter">Chỉ người khớp thuộc tính</span>
           </label>

@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically")
     parser.add_argument("--samples_dir", type=str, default=str(ROOT / "samples"),
                         help="Folder of sample videos shown in the UI (default: ./samples)")
+    parser.add_argument("--no_clip", action="store_true", help="Do not load the CLIP scorer (saves ~600 MB RAM)")
     parser.add_argument("--max_upload_mb", type=int, default=1024, help="Upload size limit in MB")
     args = parser.parse_args()
 
@@ -46,7 +47,7 @@ def main():
     from webapp.engine import SearchEngine
     from webapp.server import create_app
 
-    engine = SearchEngine(ROOT)
+    engine = SearchEngine(ROOT, use_clip=not args.no_clip)
     app = create_app(engine, ROOT / "uploads", Path(args.samples_dir), args.max_upload_mb)
 
     url = f"http://{args.host}:{args.port}"

@@ -18,7 +18,7 @@ TEXT = {
         "q_mot": "Q_mot (chuyển động)",
         "video": "Video",
         "model": "Checkpoint",
-        "weights": "Trọng số (joint / app / mot)",
+        "weights": "Trọng số",
         "processed": "Số frame đã phân tích",
         "persons": "Số người phát hiện",
         "created": "Thời gian tạo",
@@ -37,7 +37,7 @@ TEXT = {
         "q_mot": "Q_mot (motion)",
         "video": "Video",
         "model": "Checkpoint",
-        "weights": "Weights (joint / app / mot)",
+        "weights": "Weights",
         "processed": "Frames analysed",
         "persons": "Persons detected",
         "created": "Created",
@@ -72,6 +72,8 @@ def build_report(analysis: Analysis, search: Dict[str, Any], ranked: List[Dict[s
             "joint": s["joint"],
             "app": s["app"],
             "mot": s["mot"],
+            "clip": s.get("clip"),
+            "clip_raw": s.get("clip_raw"),
             **{f"{k}_prob": round(t.attrs[k], 3) if k in t.attrs else None for k in ATTR_NAMES},
             "top_color": max(t.attrs["top_color"], key=t.attrs["top_color"].get) if t.attrs.get("top_color") else None,
             "bottom_color": max(t.attrs["bottom_color"], key=t.attrs["bottom_color"].get) if t.attrs.get("bottom_color") else None,
@@ -136,7 +138,7 @@ def _html(analysis: Analysis, meta: Dict[str, Any], rows: List[Dict[str, Any]], 
   <div class="body">
     <h3>{tx['person']} {r['person_id']}</h3>
     <p class="score"><b>{r['fused']:.4f}</b> · {tx['prob']}: <b>{r['prob'] * 100:.1f}%</b></p>
-    <p class="sub">joint {r['joint']:.4f} · app {r['app']:.4f} · mot {r['mot']:.4f}</p>
+    <p class="sub">joint {r['joint']:.4f} · app {r['app']:.4f} · mot {r['mot']:.4f}{f" · clip {r['clip']:.4f}" if r.get('clip') is not None else ""}</p>
     <p class="sub">{tx['time']}: {_fmt_time(r['start_s'])} → {_fmt_time(r['end_s'])} · {tx['frames']} {r['start_frame']}–{r['end_frame']}</p>
     <div class="film">{film}</div>
   </div>
@@ -170,7 +172,7 @@ border-radius:14px;padding:14px}}
   <div><span>{tx['q_mot']}</span>{e(meta['q_mot'])}</div>
   <div><span>{tx['video']}</span>{e(meta['video'])}</div>
   <div><span>{tx['model']}</span>{e(str(meta['checkpoint']))}</div>
-  <div><span>{tx['weights']}</span>{w.get('joint', 0):.2f} / {w.get('app', 0):.2f} / {w.get('mot', 0):.2f}</div>
+  <div><span>{tx['weights']}</span>{" / ".join(f"{k} {v:.2f}" for k, v in w.items())}</div>
   <div><span>{tx['processed']}</span>{meta['frames_processed']} / {meta['frames_total']}</div>
   <div><span>{tx['persons']}</span>{meta['persons_detected']}</div>
   <div><span>{tx['created']}</span>{meta['created']}</div>

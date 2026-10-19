@@ -7,7 +7,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const SOFTMAX_TAU = 0.07;
 const NEUTRAL = "#94a3b8";
 const DARK_TEXT_RANKS = new Set([1, 2, 3, 7, 8, 9]);
-const STAGE_ORDER = ["prepare", "detect", "crops", "encode", "stitch"];
+const STAGE_ORDER = ["prepare", "detect", "crops", "clip", "encode", "stitch"];
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("ps." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -67,10 +67,16 @@ function setPressed(container, attr, value) {
 }
 
 // ======================================================================== ranking (mirrors SearchEngine.rank)
+/** Score branches in use: joint/app/mot, plus clip when the server has CLIP. */
+function weightKeys() {
+  return Object.keys(S.defaults).filter((k) => k !== "clip" || S.status?.clip);
+}
+
 function normWeights() {
   const w = S.weights;
-  const sum = Math.max(0, w.joint) + Math.max(0, w.app) + Math.max(0, w.mot) || 1;
-  return { joint: Math.max(0, w.joint) / sum, app: Math.max(0, w.app) / sum, mot: Math.max(0, w.mot) / sum };
+  const keys = weightKeys();
+  const sum = keys.reduce((a, k) => a + Math.max(0, w[k] ?? 0), 0) || 1;
+  return Object.fromEntries(keys.map((k) => [k, Math.max(0, w[k] ?? 0) / sum]));
 }
 
 function rerank() {
@@ -81,7 +87,7 @@ function rerank() {
   if (!scores.length) { S.ranked = []; refresh(); return; }
   const ranked = scores.map((s) => ({
     ...s,
-    fused: w.joint * s.joint + w.app * s.app + w.mot * s.mot - (s.penalty ?? 0),
+    fused: Object.keys(w).reduce((a, k) => a + w[k] * (s[k] ?? 0), 0) - (s.penalty ?? 0),
   }));
   ranked.sort((a, b) => b.fused - a.fused);
   const m = ranked[0].fused;
@@ -98,7 +104,10 @@ async function loadStatus() {
   S.status = st;
   S.palette = st.palette;
   S.defaults = st.default_weights;
-  if (!S.weights) S.weights = { ...S.defaults };
+  S.weights = { ...S.defaults, ...(S.weights || {}) };   // older saved weights lack newer branches
+  $("w-clip-row").hidden = !st.clip;
+  $("stage-clip").hidden = !st.clip;
+  document.querySelector('.wbar [data-wb="clip"]').hidden = !st.clip;
   renderWeights();
 
   const sel = $("ckpt-select");
@@ -277,9 +286,9 @@ $("analyze-cancel").addEventListener("click", () => { if (S.jobs.analyze) post(`
 
 async function analyze() {
   const v = S.video;
-  if (!v?.ready || S.jobs.analyze) return;
+  if (!v?.ready) { toast("info", t("need_video")); return; }
+  if (S.jobs.analyze) { toast("info", t("job_busy")); return; }
   const btn = $("analyze-btn");
-  btn.disabled = true;
   btn.classList.add("loading");
   const box = $("analyze-progress");
   try {
@@ -354,7 +363,8 @@ $("search-form").addEventListener("submit", (e) => { e.preventDefault(); runSear
 
 async function runSearch() {
   const prompt = $("prompt").value.trim();
-  if (!prompt || !S.analysis?.tracks.length) return;
+  if (!S.analysis?.tracks.length) { toast("info", t(S.analysis ? "need_persons" : "need_analysis")); return; }
+  if (!prompt) { toast("info", t("need_prompt")); $("prompt").focus(); return; }
   const seq = ++S.searchSeq;
   const btn = $("search-btn");
   btn.classList.add("loading");
@@ -364,10 +374,7 @@ async function runSearch() {
     S.search = res;
     renderDsca();
     rerank();
-    if (S.ranked[0] && S.selected == null) {
-      // Jump to the best match the first time
-      player.seekFrame(trackById(S.ranked[0].track_id)?.start ?? 0);
-    }
+    if (S.ranked[0]) follow(S.ranked[0].track_id);
   } catch (err) {
     fail(err);
   } finally {
@@ -384,7 +391,6 @@ function renderDsca() {
   const cs = s.constraints || [];
   $("attr-row").hidden = !cs.length;
   $("q-attrs").innerHTML = cs.map((c) => `<span class="achip">${constraintLabel(c)}</span>`).join("");
-  $("attr-filter").disabled = !cs.length;
 }
 
 const COLOR_CSS = { black: "#111827", white: "#f8fafc", grey: "#8b8f97", red: "#dc2626", orange: "#f97316",
@@ -442,7 +448,9 @@ function renderWeights() {
   document.querySelectorAll("[data-w]").forEach((inp) => { inp.value = w[inp.dataset.w]; });
   document.querySelectorAll("[data-wv]").forEach((o) => { o.textContent = `${Math.round(n[o.dataset.wv] * 100)}%`; });
   document.querySelectorAll("[data-wb]").forEach((i) => { i.style.width = `${n[i.dataset.wb] * 100}%`; });
-  $("wtext").textContent = ["joint", "app", "mot"].map((k) => Math.round(n[k] * 100)).join("/");
+  document.querySelectorAll("[data-wv]").forEach((o) => { if (n[o.dataset.wv] == null) o.textContent = "–"; });
+  document.querySelectorAll("[data-wb]").forEach((i) => { if (n[i.dataset.wb] == null) i.style.width = "0"; });
+  $("wtext").textContent = Object.keys(n).map((k) => Math.round(n[k] * 100)).join("/");
   setPressed($("topk-seg"), "data-k", S.topK);
   $("show-all").checked = S.showAll;
   $("attr-filter").checked = S.attrFilter;
@@ -485,14 +493,22 @@ $("weights-reset").addEventListener("click", () => {
 });
 
 // ======================================================================== selection
-function select(id, { seek = true } = {}) {
+/** Tracks one person: selects it (spotlight in the player), jumps to its first appearance and plays. */
+function follow(id) {
+  S.selected = null;
+  select(id, { scrollCard: false });
+  $("player-card").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  player.video.play().catch(() => {});
+}
+
+function select(id, { seek = true, scrollCard = true } = {}) {
   S.selected = S.selected === id ? null : id;
   if (S.selected != null && seek) {
     const tr = trackById(id);
     if (tr) { player.video.pause(); player.seekFrame(tr.start); }
   }
   refresh();
-  if (S.selected != null) {
+  if (S.selected != null && scrollCard) {
     document.querySelector(`.cand[data-id="${id}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 }
@@ -540,10 +556,6 @@ function renderResults() {
   box.hidden = false;
   const items = viewItems();
   const searched = S.ranked.length > 0;
-  $("render-btn").disabled = !searched || !!S.jobs.render;
-  $("report-btn").disabled = !searched;
-  $("rank-toolbar").classList.toggle("disabled", !searched);
-  if (!searched) setPopover(false);
 
   // ---- summary
   const sum = $("summary");
@@ -575,7 +587,8 @@ function renderResults() {
   $("cand-count").textContent = searched ? `${Math.min(S.topK, S.ranked.length)} / ${S.ranked.length}` : `${items.length}`;
 
   const ranges = {};
-  if (searched) for (const k of ["joint", "app", "mot"]) {
+  const barKeys = ["joint", "app", "mot", ...(S.ranked[0]?.clip != null ? ["clip"] : [])];
+  if (searched) for (const k of barKeys) {
     const vals = S.ranked.map((s) => s[k]);
     ranges[k] = [Math.min(...vals), Math.max(...vals)];
   }
@@ -607,7 +620,7 @@ function renderResults() {
           ${attrBadges(tr, s)}
           <span>${esc(t("appears"))} <span class="mono">${time}</span></span>
         </div>
-        ${s ? `<div class="scorebars">${bar("joint", s.joint)}${bar("app", s.app)}${bar("mot", s.mot)}</div>` : ""}
+        ${s ? `<div class="scorebars">${barKeys.map((k) => bar(k, s[k])).join("")}</div>` : ""}
         <div class="film">${tr.film.map((f) => `<img src="${f}" alt="" loading="lazy">`).join("")}</div>
       </div>
       <button type="button" class="vis" data-vis="${it.id}" title="${esc(t("show_hide"))}"><svg><use href="#${off ? "i-eye-off" : "i-eye"}"/></svg></button>
@@ -648,10 +661,10 @@ function rankBody() {
 }
 
 $("render-btn").addEventListener("click", async () => {
-  if (!S.search || S.jobs.render) return;
+  if (!S.search) { toast("info", t("need_search")); $("prompt").focus(); return; }
+  if (S.jobs.render) { toast("info", t("job_busy")); return; }
   const btn = $("render-btn");
   const prog = btn.querySelector(".btn-progress");
-  btn.disabled = true;
   btn.classList.add("loading");
   prog.hidden = false;
   try {
@@ -670,14 +683,13 @@ $("render-btn").addEventListener("click", async () => {
     btn.classList.remove("loading");
     prog.hidden = true;
     prog.firstElementChild.style.width = "0";
-    btn.disabled = false;
   }
 });
 
 $("report-btn").addEventListener("click", async () => {
-  if (!S.search) return;
+  if (!S.search) { toast("info", t("need_search")); $("prompt").focus(); return; }
   const btn = $("report-btn");
-  btn.disabled = true;
+  if (btn.classList.contains("loading")) return;
   btn.classList.add("loading");
   try {
     const { blob, filename } = await postBlob(`/api/analyses/${S.analysis.analysis_id}/report`, rankBody());
@@ -686,7 +698,6 @@ $("report-btn").addEventListener("click", async () => {
   } catch (err) {
     fail(err);
   } finally {
-    btn.disabled = false;
     btn.classList.remove("loading");
   }
 });
@@ -729,9 +740,7 @@ function updateSteps() {
     });
     $("as-sub").textContent = t("as_sub", { persons: S.analysis.tracks.length });
   }
-  $("analyze-btn").disabled = !ready || !!S.jobs.analyze;
   $("analyze-btn").querySelector("span").textContent = t(analysed ? "reanalyze" : "analyze");
-  $("search-btn").disabled = !hasTracks;
 }
 
 $("theme-btn").addEventListener("click", () => {
