@@ -620,7 +620,7 @@ class SearchEngine:
             chunk = items[b:b + CLIP_BATCH]
             x = self.clip_processor(images=[im for _, im in chunk], return_tensors="pt")["pixel_values"].to(self.device)
             with self.model_lock, torch.inference_mode():
-                f = F.normalize(self.clip_model.get_image_features(pixel_values=x).float().cpu(), dim=-1)
+                f = F.normalize(self.clip_model.get_image_features(x).float().cpu(), dim=-1)
             for (tid, _), v in zip(chunk, f):
                 feats.setdefault(tid, []).append(v)
             if progress:
